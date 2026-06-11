@@ -10,6 +10,7 @@
 SAM3D/sam-3d-body/
 SAM3D/sam-3d-objects/
 SAM3D/detectron2/
+.claude
 
 # ── Evaluation results & generated submissions ────────────────────────────────
 Evaluation/eval_results/

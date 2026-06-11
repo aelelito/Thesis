@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Read(//tmp/**)",
-      "Read(//home/lleba/VESPA/src/labeling/**)"
-    ]
-  }
-}
