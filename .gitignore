@@ -1,0 +1,31 @@
+# ── Model weights & checkpoints ───────────────────────────────────────────────
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+
+# ── SAM3 / SAM3D third-party cloned repos (your notebooks at SAM3D/ are kept) ─
+SAM3D/sam-3d-body/
+SAM3D/sam-3d-objects/
+SAM3D/detectron2/
+
+# ── Evaluation results & generated submissions ────────────────────────────────
+Evaluation/eval_results/
+Evaluation/submissions/nuscenes_mini/
+Evaluation/submissions/ecp/
+
+# ── Numpy arrays (masks, point clouds, etc.) ─────────────────────────────────
+*.npy
+*.npz
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.egg-info/
+.env

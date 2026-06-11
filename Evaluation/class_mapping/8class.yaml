@@ -1,0 +1,53 @@
+classes: ["car", "truck", "bus", "trailer", "construction_vehicle",
+          "pedestrian", "motorcycle", "bicycle"]
+
+# Evaluation distance ranges per class (metres), following nuScenes CVPR-2019.
+class_ranges:
+  car:                  50
+  truck:                50
+  bus:                  50
+  trailer:              50
+  construction_vehicle: 50
+  pedestrian:           40
+  motorcycle:           40
+  bicycle:              40
+
+# Maps nuScenes ground-truth category names → final detection class names.
+# null = excluded from evaluation (matches the official nuScenes benchmark protocol).
+mapping_nuscenes:
+  vehicle.bicycle:                      "bicycle"
+  vehicle.bus.bendy:                    "bus"
+  vehicle.bus.rigid:                    "bus"
+  vehicle.car:                          "car"
+  vehicle.construction:                 "construction_vehicle"
+  vehicle.motorcycle:                   "motorcycle"
+  vehicle.trailer:                      "trailer"
+  vehicle.truck:                        "truck"
+  human.pedestrian.adult:               "pedestrian"
+  human.pedestrian.child:               "pedestrian"
+  human.pedestrian.construction_worker: "pedestrian"
+  human.pedestrian.police_officer:      "pedestrian"
+  # Excluded
+  human.pedestrian.personal_mobility:   null
+  human.pedestrian.stroller:            null
+  human.pedestrian.wheelchair:          null
+  movable_object.barrier:               null
+  movable_object.debris:                null
+  movable_object.pushable_pullable:     null
+  movable_object.trafficcone:           null
+  static_object.bicycle_rack:           null
+  animal:                               null
+  vehicle.emergency.ambulance:          null
+  vehicle.emergency.police:             null
+
+# Maps ECP ground-truth category names → final detection class names.
+# ECP uses simplified category names that match the detection class names directly.
+mapping_ecp:
+  car:                  "car"
+  truck:                "truck"
+  bus:                  "bus"
+  trailer:              "trailer"
+  construction_vehicle: "construction_vehicle"
+  pedestrian:           "pedestrian"
+  motorcycle:           "motorcycle"
+  bicycle:              "bicycle"

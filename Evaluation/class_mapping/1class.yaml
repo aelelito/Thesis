@@ -1,0 +1,47 @@
+classes: ["vehicle"]
+
+# Evaluation distance range per class (metres), following nuScenes CVPR-2019.
+# 'vehicle' inherits the 'car' range since it is not a native nuScenes class.
+class_ranges:
+  vehicle: 50
+
+# Maps nuScenes ground-truth category names → final detection class names.
+# null = excluded from evaluation (matches the official nuScenes benchmark protocol).
+mapping_nuscenes:
+  vehicle.bicycle:                      "vehicle"
+  vehicle.bus.bendy:                    "vehicle"
+  vehicle.bus.rigid:                    "vehicle"
+  vehicle.car:                          "vehicle"
+  vehicle.construction:                 "vehicle"
+  vehicle.motorcycle:                   "vehicle"
+  vehicle.trailer:                      "vehicle"
+  vehicle.truck:                        "vehicle"
+  human.pedestrian.adult:               "vehicle"
+  human.pedestrian.child:               "vehicle"
+  human.pedestrian.construction_worker: "vehicle"
+  human.pedestrian.police_officer:      "vehicle"
+  # Excluded
+  human.pedestrian.personal_mobility:   null
+  human.pedestrian.stroller:            null
+  human.pedestrian.wheelchair:          null
+  movable_object.barrier:               null
+  movable_object.debris:                null
+  movable_object.pushable_pullable:     null
+  movable_object.trafficcone:           null
+  static_object.bicycle_rack:           null
+  animal:                               null
+  vehicle.emergency.ambulance:          null
+  vehicle.emergency.police:             null
+
+# Maps ECP ground-truth category names → final detection class names.
+# ECP uses simplified category names (already the short form), so this is
+# an identity-style mapping for recognised classes.
+mapping_ecp:
+  car:                  "vehicle"
+  truck:                "vehicle"
+  bus:                  "vehicle"
+  trailer:              "vehicle"
+  construction_vehicle: "vehicle"
+  pedestrian:           "vehicle"
+  motorcycle:           "vehicle"
+  bicycle:              "vehicle"

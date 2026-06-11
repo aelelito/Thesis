@@ -1,0 +1,46 @@
+classes: ["vehicle", "pedestrian", "bicycle"]
+
+# Evaluation distance ranges per class (metres), following nuScenes CVPR-2019.
+class_ranges:
+  vehicle:    50
+  pedestrian: 40
+  bicycle:    40
+
+# Maps nuScenes ground-truth category names → final detection class names.
+# null = excluded from evaluation (matches the official nuScenes benchmark protocol).
+mapping_nuscenes:
+  vehicle.bicycle:                      "bicycle"
+  vehicle.bus.bendy:                    "vehicle"
+  vehicle.bus.rigid:                    "vehicle"
+  vehicle.car:                          "vehicle"
+  vehicle.construction:                 "vehicle"
+  vehicle.motorcycle:                   "bicycle"
+  vehicle.trailer:                      "vehicle"
+  vehicle.truck:                        "vehicle"
+  human.pedestrian.adult:               "pedestrian"
+  human.pedestrian.child:               "pedestrian"
+  human.pedestrian.construction_worker: "pedestrian"
+  human.pedestrian.police_officer:      "pedestrian"
+  # Excluded
+  human.pedestrian.personal_mobility:   null
+  human.pedestrian.stroller:            null
+  human.pedestrian.wheelchair:          null
+  movable_object.barrier:               null
+  movable_object.debris:                null
+  movable_object.pushable_pullable:     null
+  movable_object.trafficcone:           null
+  static_object.bicycle_rack:           null
+  animal:                               null
+  vehicle.emergency.ambulance:          null
+  vehicle.emergency.police:             null
+
+# Maps ECP ground-truth category names → final detection class names.
+mapping_ecp:
+  car:                  "vehicle"
+  truck:                "vehicle"
+  bus:                  "vehicle"
+  trailer:              "vehicle"
+  construction_vehicle: "vehicle"
+  pedestrian:           "pedestrian"
+  motorcycle:           "bicycle"
+  bicycle:              "bicycle"

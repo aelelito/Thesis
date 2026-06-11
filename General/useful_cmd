@@ -1,0 +1,201 @@
+####################### run docker ######################
+cd prius2nuscenes
+./docker-run.sh
+# important: add the access for the docker to the data in docker-run.sh: --volume=/media/lleba/ECP_Nuscenes_01:/data
+
+####################### export dataset to Segments.ai (without sample_data_to_annotate.json)####################
+# export Segments.ai API key
+export SEGMENTS_API_KEY=5847f0b889ee3dfd2aab70194365dd0b90870f94
+
+# export data to Segments.ai
+python3 utils/export_to_Segments.py \
+ --dataroot /workspaces/nuscenes \
+ --version v1.0-mini \
+ --channel LIDAR_TOP \
+ --dataset lebaleander/ECP \
+ --upload \
+ --sample_name nuScenes_mini_example \
+ --cameras CAM_FRONT_LEFT CAM_FRONT CAM_FRONT_RIGHT \
+ --max_frames 40 \
+ --add_labels
+
+######################## integrate segments.ai annotations back in nuscenes dataset format #########################
+# download release from segments.ai
+# clean it up to only keep LABELED samples: python3 /home/lleba/Thesis/Data/ECP/clean_segments_release.py <path_to_json>
+# create /labels inside /ecp2nuscenes (if not already existant)
+# run following command to integrate annotations back to nuscenes format
+python3 utils/create_annotations_fromSegments.py \
+    --nusc_path /data/output2/ecp2nuscenes \
+    --version v1.0-trainval \
+    --lidar_sensor LIDAR_TOP
+
+######################## create recording of the dataset ############################
+# script: /home/lleba/Thesis/Data/ECP/visualize_ecp_rerun.py
+# drop-in replacement for python -m nuscenes_dataset, adds 2D projected bounding boxes on camera images
+
+# from within docker
+## Manual Annotations ##
+docker run --rm \
+  -v /media/lleba/ECP_Nuscenes_01:/data \
+  -v /home/lleba/Thesis/Data/ECP:/host_scripts \
+  rerun:latest \
+  python /host_scripts/visualize_ecp_rerun.py \
+    --root-dir /data/output2/ecp2nuscenes \
+    --scene-name scene-euro-citystrasbourg-scenariolatesession-00002_1 \
+    --manual \
+    --headless \
+    --viz_file /data/Visualization/recording.rrd \
+    --save-video /data/Visualization/manual_annotation_cam_front.mp4
+
+## VESPA ##
+docker run --rm \
+  -v /media/lleba/ECP_Nuscenes_01:/data \
+  -v /home/lleba/Thesis/Data/ECP:/host_scripts \
+  -v /home/lleba/vespa/outs:/vespa_outs \
+  rerun:latest \
+  python /host_scripts/visualize_ecp_rerun.py \
+    --root-dir /data/output2/ecp2nuscenes \
+    --scene-name scene-euro-citystrasbourg-scenariolatesession-00007_1 \
+    --vespa \
+    --detections /vespa_outs/vlm/p_final/scene-euro-citystrasbourg-scenariolatesession-00007_1/#out_labels/vlm_p_final_all_8class.json \
+    --headless \
+    --viz_file /data/Visualization/recording_vespa_00007_1.rrd \
+    --save-video /data/Visualization/vespa_cam_front_00007_1.mp4
+
+# for video, CAM_FRONT is the default, to specify another camera, add
+    --video-camera CAM_FRONT_LEFT # CAM_FRONT, CAM_FRONT_LEFT, CAM_FRONT_RIGHT are available
+
+###################### visualize recording in rerun ############################
+conda activate rerun
+
+rerun /media/lleba/ECP_Nuscenes_01/output2/recording.rrd
+
+
+
+###################### DOCKER #########################
+### check docker images
+docker images
+
+### check containers (running or stopped)
+docker ps
+
+
+#################### CONDA Environments #####################
+### check available conda env
+conda env list
+
+### delete conda env
+conda remove --name my_env --all
+
+
+#################### run SAM3 and visualize after ######################
+conda activate sam3
+
+# create segmentation masks for prompts
+python get_sam3_masks_for_nuscenes_trainval.py
+
+# visualize results
+python visualize_sam3_results.py
+
+
+#################### run VESPA #######################
+# adapt config file to process correct dataset
+
+# for ECP adapt configs/vlm/p_final_ecp.yaml:
+# root_path: "/media/lleba/ECP_Nuscenes_01/output2/ecp2nuscenes"
+# dataset: nuscenes
+# dataset_version: "v1.0-trainval"
+
+# for nuScenes adapt configs/vlm/p_final.yaml:
+# root_path: "/media/lleba/nuScenes_mini"
+# dataset: nuscenes
+# dataset_version: "v1.0-mini"
+
+# on workstation (for process to keep running even after terminating ssh)
+tmux new -s VESPA # session is called "vespa"
+
+cd /home/lleba/VESPA
+
+# run from inside docker
+# add volume to the docker: - /media/lleba:/media/lleba
+docker-compose up -d
+docker-compose exec edgar_unsupervised bash
+
+# run vespa on a selected scene (vespa pipeline continues at same point if terminated)
+python main_pseudo_vlm.py \
+  --config configs/vlm/p_final.yaml \
+  --scenes scene-euro-citystrasbourg-scenariolatesession-00003_1 \
+  --workers 1
+
+# to detach (before leaving SSH): ctrl+B -> D
+# reattach (after new SSH): tmux attach -t vespa
+# list running sessions
+tmux ls
+
+################## mount disk (after reboot) ####################
+sudo mount /dev/sdb1 /media/lleba/ECP_Nuscenes_01
+
+
+################### run evalutation for pseudo labels #####################
+cd /home/lleba/Thesis/Development/Evaluation
+
+## submission file
+# convert pseudo labels into the correct submission JSON format for evaluation
+# probably already in correct format coming out of the autolabeling pipeline (this is the case for VESPA)
+# if not, run the following script
+conda run -n sam3 python submission/generate_submission.py \
+  --split train \
+  --mapping 8class \
+  --out submissions/nuscenes_mini/submission_train_8class.json
+
+# or for when wanting to sanity check the evaluation pipeline with the GT labels as submission
+# nuscenes
+conda run -n sam3 python submission/make_gt_submission_nuscenes.py \
+  --split train \
+  --mapping 8class \
+  --out submissions/nuscenes_mini/gt_submission_train_8class.json
+
+# ecp
+conda run -n sam3 python submission/make_gt_submission_ecp.py \
+  --split train \
+  --mapping 8class \
+  --out submissions/ecp/gt_submission_train_8class.json
+
+## evaluation
+# then run the evaluation with the generated submission file, use the following command (adapt paths accordingly)
+# nuscenes
+conda run -n sam3 python evaluation.py \
+  --dataset nuscenes \
+  --submission /home/lleba/VESPA/outs/vlm/p_final/#out_labels/vlm_p_final_train_8class.json \
+  --out_dir eval_results/nuscenes_mini/vespa_vlm_train_8class/ \
+  --plot_examples 10
+
+# ecp
+conda run -n sam3 python evaluation.py \
+  --dataset ecp \
+  --submission /home/lleba/VESPA/outs/vlm/p_final_ecp/#out_labels/vlm_p_final_ecp_train_8class.json \
+  --out_dir eval_results/nuscenes_mini/vespa_vlm_train_8class/ \
+  --plot_examples 10
+
+# to run the ground truth sanity check evaluation, use the following command (adapt paths accordingly)
+# nuscenes
+conda run -n sam3 python evaluation.py \
+  --dataset nuscenes \
+  --submission submissions/nuscenes_mini/gt_submission_train_8class.json \
+  --out_dir eval_results/nuscenes_mini/gt_sanity_train_8class/ \
+  --plot_examples 10
+
+# ecp
+conda run -n sam3 python evaluation.py \
+  --dataset ecp \
+  --submission submissions/ecp/gt_submission_train_8class.json \
+  --out_dir eval_results/ecp/gt_sanity_train_8class/ \
+  --plot_examples 10
+
+## report
+# generate evaluation report in a more compact form for better readability
+python make_eval_report.py \
+  --eval_dir eval_results/nuscenes_mini/vespa_vlm_train_8class/ \
+  --out_dir eval_results/nuscenes_mini/vespa_vlm_train_8class/
+
+# for information on how evaluation is done, see README_evaluation.md
