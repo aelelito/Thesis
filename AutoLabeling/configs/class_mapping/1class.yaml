@@ -1,0 +1,11 @@
+# Maps 8class pipeline detection names → 1class submission names.
+# Classes: vehicle (everything is a vehicle)
+remap:
+  car:                  "vehicle"
+  truck:                "vehicle"
+  bus:                  "vehicle"
+  trailer:              "vehicle"
+  construction_vehicle: "vehicle"
+  pedestrian:           "vehicle"
+  motorcycle:           "vehicle"
+  bicycle:              "vehicle"

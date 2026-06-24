@@ -323,7 +323,8 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 # --- 1. INITIALIZE MODEL ONCE (OUTSIDE LOOPS) ---
 print("Initializing SAM3 model... (this happens only once)")
-SAM3_CKPT = "/home/lleba/.cache/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt"
+from huggingface_hub import hf_hub_download
+SAM3_CKPT = hf_hub_download(repo_id="facebook/sam3", filename="sam3.pt")
 gpus = range(torch.cuda.device_count())
 predictor = build_sam3_video_predictor(gpus_to_use=gpus, checkpoint_path=SAM3_CKPT)
 print("Model initialized.")

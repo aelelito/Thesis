@@ -43,6 +43,7 @@ from typing import Dict, List, Optional, Tuple
 import nuscenes
 import nuscenes.eval.common.loaders
 import nuscenes.eval.detection.evaluate
+import nuscenes.eval.detection.constants as _det_constants
 from nuscenes.eval.common.data_classes import EvalBoxes
 from nuscenes.eval.detection.evaluate import DetectionEval
 from nuscenes.utils.data_classes import LidarPointCloud
@@ -255,10 +256,13 @@ def evaluate(
         if _token_to_scene.get(t) in set(active_scenes)
     ]
 
-    orig_cat_fn   = nuscenes.eval.common.loaders.category_to_detection_name
-    orig_split_fn = nuscenes.eval.common.loaders.create_splits_scenes
-    orig_load_gt  = nuscenes.eval.detection.evaluate.load_gt
+    orig_cat_fn    = nuscenes.eval.common.loaders.category_to_detection_name
+    orig_split_fn  = nuscenes.eval.common.loaders.create_splits_scenes
+    orig_load_gt   = nuscenes.eval.detection.evaluate.load_gt
     orig_load_pred = nuscenes.eval.detection.evaluate.load_prediction
+    orig_det_names = list(_det_constants.DETECTION_NAMES)
+    orig_pretty    = dict(_det_constants.PRETTY_DETECTION_NAMES)
+    orig_colors    = dict(_det_constants.DETECTION_COLORS)
 
     nuscenes.eval.common.loaders.category_to_detection_name = make_category_fn(
         mapping_name, dataset='ecp'
@@ -270,6 +274,28 @@ def evaluate(
     nuscenes.eval.detection.evaluate.load_prediction = _make_annotated_only_load_pred(
         orig_load_pred, active_annotated_tokens
     )
+    _det_constants.DETECTION_NAMES.clear()
+    _det_constants.DETECTION_NAMES.extend(cfg.class_names)
+    _det_constants.PRETTY_DETECTION_NAMES.clear()
+    _det_constants.PRETTY_DETECTION_NAMES.update({k: k for k in cfg.class_names})
+    _det_constants.DETECTION_COLORS.clear()
+    _det_constants.DETECTION_COLORS.update({k: f"C{i}" for i, k in enumerate(cfg.class_names)})
+
+    # Guard: nuScenes' _get_box_class_field crashes when no annotated sample has
+    # any predictions (box=None after iterating all empty lists). This happens when
+    # the submission covers only unannotated frames. Bail early with a clear message.
+    any_predictions = any(
+        sub['results'].get(t) for t in active_annotated_tokens
+    )
+    if not any_predictions:
+        print(
+            f'\nERROR: The submission contains no predictions for any of the '
+            f'{len(active_annotated_tokens)} annotated sample(s).\n'
+            f'Make sure you run the pipeline on the annotated keyframes, not arbitrary frame ranges.\n'
+            f'Hint: run without --frame-start/--frame-end to process all frames, '
+            f'or check which frames are annotated first.'
+        )
+        return
 
     try:
         evaluator = DetectionEval(
@@ -280,21 +306,29 @@ def evaluate(
             output_dir=str(out_dir),
             verbose=True,
         )
-    finally:
         nuscenes.eval.common.loaders.category_to_detection_name = orig_cat_fn
         nuscenes.eval.common.loaders.create_splits_scenes       = orig_split_fn
         nuscenes.eval.detection.evaluate.load_gt                = orig_load_gt
         nuscenes.eval.detection.evaluate.load_prediction        = orig_load_pred
 
-    # ECP's sample['data'] is unpopulated → use index-based LIDAR lookup.
-    # Single key-frame read (no multi-sweep chain available).
-    lidar_index = _build_lidar_index() if plot_examples > 0 else {}
-    lidar_fn    = make_ecp_lidar_fn(lidar_index, ECP_ROOT)
-    vis_fn      = make_patched_visualize_sample(lidar_fn=lidar_fn)
+        lidar_index = _build_lidar_index() if plot_examples > 0 else {}
+        lidar_fn    = make_ecp_lidar_fn(lidar_index, ECP_ROOT)
+        vis_fn      = make_patched_visualize_sample(lidar_fn=lidar_fn)
 
-    with eval_patches(cfg, visualize_sample_fn=vis_fn):
-        evaluator.main(plot_examples=plot_examples, render_curves=True)
-    augment_metrics_summary(out_dir, cfg)
+        with eval_patches(cfg, visualize_sample_fn=vis_fn):
+            evaluator.main(plot_examples=plot_examples, render_curves=True)
+        augment_metrics_summary(out_dir, cfg)
+    finally:
+        nuscenes.eval.common.loaders.category_to_detection_name = orig_cat_fn
+        nuscenes.eval.common.loaders.create_splits_scenes       = orig_split_fn
+        nuscenes.eval.detection.evaluate.load_gt                = orig_load_gt
+        nuscenes.eval.detection.evaluate.load_prediction        = orig_load_pred
+        _det_constants.DETECTION_NAMES.clear()
+        _det_constants.DETECTION_NAMES.extend(orig_det_names)
+        _det_constants.PRETTY_DETECTION_NAMES.clear()
+        _det_constants.PRETTY_DETECTION_NAMES.update(orig_pretty)
+        _det_constants.DETECTION_COLORS.clear()
+        _det_constants.DETECTION_COLORS.update(orig_colors)
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -312,6 +346,27 @@ def _validate_submission(path: Path) -> dict:
     return sub
 
 
+def _merge_submissions(paths: list[Path]) -> dict:
+    """Merge multiple submission JSONs into one. All must share the same split and mapping_name."""
+    subs = [_validate_submission(p) for p in paths]
+    split        = subs[0]['split']
+    mapping_name = subs[0]['mapping_name']
+    for i, s in enumerate(subs[1:], 1):
+        if s['split'] != split:
+            raise ValueError(f'Split mismatch: {paths[0].name} has split={split!r} but {paths[i].name} has split={s["split"]!r}')
+        if s['mapping_name'] != mapping_name:
+            raise ValueError(f'Mapping mismatch: {paths[0].name} has mapping={mapping_name!r} but {paths[i].name} has mapping={s["mapping_name"]!r}')
+    merged_results: dict = {}
+    for s in subs:
+        merged_results.update(s['results'])
+    return {
+        'split': split,
+        'mapping_name': mapping_name,
+        'meta': subs[0].get('meta', {}),
+        'results': merged_results,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Evaluate ECP pseudo labels using nuScenes detection metrics',
@@ -319,8 +374,8 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
-        '--submission', type=Path, required=True,
-        help='Path to the submission JSON',
+        '--submission', type=Path, required=True, nargs='+',
+        help='Path(s) to submission JSON file(s). Multiple files are merged before evaluation.',
     )
     parser.add_argument(
         '--split', choices=['train', 'val'], default=None,
@@ -340,23 +395,34 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    submission_path = args.submission.resolve()
-    if not submission_path.exists():
-        raise FileNotFoundError(f'Submission not found: {submission_path}')
+    submission_paths = [p.resolve() for p in args.submission]
+    for p in submission_paths:
+        if not p.exists():
+            raise FileNotFoundError(f'Submission not found: {p}')
 
-    sub = _validate_submission(submission_path)
+    sub = _merge_submissions(submission_paths)
 
     annotated_scenes, annotated_tokens = _get_annotated_info()
 
     out_dir = (
         args.out_dir.resolve() if args.out_dir
-        else Path(__file__).parent / 'eval_results' / submission_path.stem / 'ecp'
+        else Path(__file__).parent / 'eval_results' / submission_paths[0].stem / 'ecp'
     )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write merged submission to disk so DetectionEval can read it by path
+    if len(submission_paths) > 1:
+        submission_path = out_dir / 'merged_submission.json'
+        with open(submission_path, 'w') as f:
+            json.dump(sub, f)
+    else:
+        submission_path = submission_paths[0]
 
     raw_split  = args.split if args.split is not None else sub['split']
     scene_info = f'  ({", ".join(args.scenes)})' if args.scenes else f'  (all {len(annotated_scenes)} annotated scenes)'
+    sub_names  = ', '.join(p.name for p in submission_paths)
 
-    print(f'Submission          : {submission_path.name}')
+    print(f'Submission          : {sub_names}')
     print(f'Version             : {ECP_VERSION}')
     print(f'Split               : {raw_split}')
     print(f'Scenes              :{scene_info}')

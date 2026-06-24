@@ -42,6 +42,7 @@ mapping_nuscenes:
 
 # Maps ECP ground-truth category names → final detection class names.
 # ECP uses simplified category names that match the detection class names directly.
+# Needed because the ECP GT uses different names than nuScenes
 mapping_ecp:
   car:                  "car"
   truck:                "truck"

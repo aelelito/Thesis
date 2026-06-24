@@ -80,7 +80,7 @@ def setup_sam3d_body():
     import torch
     from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
     from tools.build_detector import HumanDetector
-    from tools.build_fov_estimator import FOVEstimator
+
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -94,15 +94,14 @@ def setup_sam3d_body():
     print("Loading ViTDet human detector...")
     human_detector = HumanDetector(name="vitdet", device=device)
     
-    print("Loading MoGe FOV estimator...")
-    fov_estimator = FOVEstimator(name="moge2", device=device)
-    
+    # FOVEstimator (moge2) is skipped — cam_int from nuScenes is always provided,
+    # so FOV estimation is never called at runtime. moge.model.v2 not available in autolabeling env.
     estimator = SAM3DBodyEstimator(
         sam_3d_body_model=model,
         model_cfg=model_cfg,
         human_detector=human_detector,
         human_segmentor=None,  # ViTDet provides boxes; segmentation not required
-        fov_estimator=fov_estimator,
+        fov_estimator=None,
     )
     
     print("SAM 3D Body ready.\n")

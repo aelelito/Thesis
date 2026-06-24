@@ -118,6 +118,17 @@ def _build_dataframe(summary: dict) -> pd.DataFrame:
         "#FN":    _sum_col("#FN"),
     }
 
+    # Snapshot sums before appending any mean rows to avoid double-counting
+    sum_gt = _sum_col("#GT")
+    sum_tp = _sum_col("#TP")
+    sum_fp = _sum_col("#FP")
+    sum_fn = _sum_col("#FN")
+
+    mean_all["#GT"] = sum_gt
+    mean_all["#TP"] = sum_tp
+    mean_all["#FP"] = sum_fp
+    mean_all["#FN"] = sum_fn
+
     # Attach metadata for use in rendering functions
     _build_dataframe._counts_th     = counts_th
     _build_dataframe._no_gt_classes = no_gt_classes
@@ -141,10 +152,10 @@ def _build_dataframe(summary: dict) -> pd.DataFrame:
             "AP@4.0": _ap_mean(valid_rows, "AP@4.0"),
             **_tp_mean,
             "NDS":    corrected_nds,
-            "#GT":    _sum_col("#GT"),
-            "#TP":    _sum_col("#TP"),
-            "#FP":    _sum_col("#FP"),
-            "#FN":    _sum_col("#FN"),
+            "#GT":    sum_gt,
+            "#TP":    sum_tp,
+            "#FP":    sum_fp,
+            "#FN":    sum_fn,
         }
         rows.append(mean_valid)
 

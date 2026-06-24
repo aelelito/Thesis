@@ -51,6 +51,7 @@ from typing import List, Optional
 
 import nuscenes
 import nuscenes.eval.common.loaders
+import nuscenes.eval.detection.constants as _det_constants
 from nuscenes.eval.detection.evaluate import DetectionEval
 
 from class_remapping import build_detection_config, make_category_fn, VALID_MAPPINGS
@@ -109,13 +110,27 @@ def evaluate(
     # Patch (1): category_to_detection_name — maps nuScenes GT category names
     #            to the final class names for the chosen mapping scheme.
     # Patch (2): create_splits_scenes — restrict to specific scenes if requested.
-    # Both are scoped tightly around DetectionEval.__init__ and restored after.
-    orig_cat_fn   = nuscenes.eval.common.loaders.category_to_detection_name
-    orig_split_fn = nuscenes.eval.common.loaders.create_splits_scenes
+    # Patch (3): DETECTION_NAMES / PRETTY_DETECTION_NAMES / DETECTION_COLORS —
+    #            mutated in-place (same approach as VESPA) so that non-standard
+    #            class names like "vehicle" pass the devkit's assertion in
+    #            DetectionBox.deserialize and are recognised during rendering.
+    # All patches span DetectionEval.__init__ AND evaluator.main() since render()
+    # also looks up DETECTION_COLORS by class name.
+    orig_cat_fn      = nuscenes.eval.common.loaders.category_to_detection_name
+    orig_split_fn    = nuscenes.eval.common.loaders.create_splits_scenes
+    orig_det_names   = list(_det_constants.DETECTION_NAMES)
+    orig_pretty      = dict(_det_constants.PRETTY_DETECTION_NAMES)
+    orig_colors      = dict(_det_constants.DETECTION_COLORS)
 
     nuscenes.eval.common.loaders.category_to_detection_name = make_category_fn(mapping_name)
     if scenes:
         nuscenes.eval.common.loaders.create_splits_scenes = make_scene_split_fn(eval_set, scenes)
+    _det_constants.DETECTION_NAMES.clear()
+    _det_constants.DETECTION_NAMES.extend(cfg.class_names)
+    _det_constants.PRETTY_DETECTION_NAMES.clear()
+    _det_constants.PRETTY_DETECTION_NAMES.update({k: k for k in cfg.class_names})
+    _det_constants.DETECTION_COLORS.clear()
+    _det_constants.DETECTION_COLORS.update({k: f"C{i}" for i, k in enumerate(cfg.class_names)})
 
     try:
         evaluator = DetectionEval(
@@ -126,14 +141,22 @@ def evaluate(
             output_dir=str(out_dir),
             verbose=True,
         )
-    finally:
         nuscenes.eval.common.loaders.category_to_detection_name = orig_cat_fn
         nuscenes.eval.common.loaders.create_splits_scenes       = orig_split_fn
 
-    vis_fn = make_patched_visualize_sample()
-    with eval_patches(cfg, visualize_sample_fn=vis_fn):
-        evaluator.main(plot_examples=plot_examples, render_curves=True)
-    augment_metrics_summary(out_dir, cfg)
+        vis_fn = make_patched_visualize_sample()
+        with eval_patches(cfg, visualize_sample_fn=vis_fn):
+            evaluator.main(plot_examples=plot_examples, render_curves=True)
+        augment_metrics_summary(out_dir, cfg)
+    finally:
+        nuscenes.eval.common.loaders.category_to_detection_name = orig_cat_fn
+        nuscenes.eval.common.loaders.create_splits_scenes       = orig_split_fn
+        _det_constants.DETECTION_NAMES.clear()
+        _det_constants.DETECTION_NAMES.extend(orig_det_names)
+        _det_constants.PRETTY_DETECTION_NAMES.clear()
+        _det_constants.PRETTY_DETECTION_NAMES.update(orig_pretty)
+        _det_constants.DETECTION_COLORS.clear()
+        _det_constants.DETECTION_COLORS.update(orig_colors)
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 

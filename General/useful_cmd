@@ -87,6 +87,8 @@ conda env list
 ### delete conda env
 conda remove --name my_env --all
 
+### create conda env
+conda create --name my_env
 
 #################### run SAM3 and visualize after ######################
 conda activate sam3
@@ -96,7 +98,6 @@ python get_sam3_masks_for_nuscenes_trainval.py
 
 # visualize results
 python visualize_sam3_results.py
-
 
 #################### run VESPA #######################
 # adapt config file to process correct dataset
@@ -122,19 +123,30 @@ docker-compose up -d
 docker-compose exec edgar_unsupervised bash
 
 # run vespa on a selected scene (vespa pipeline continues at same point if terminated)
+# nuscenes
 python main_pseudo_vlm.py \
   --config configs/vlm/p_final.yaml \
-  --scenes scene-euro-citystrasbourg-scenariolatesession-00003_1 \
+  --workers 1
+
+# ecp (also added frame_start and frame_end as arguments)
+# GT available for roughly:
+# scene-euro-citystrasbourg-scenariolatesession-00002_1: frames 550-1340
+# scene-euro-citystrasbourg-scenariolatesession-00003_1: all frames
+# scene-euro-citystrasbourg-scenariolatesession-00007_1: frames 2550-2930
+python main_pseudo_vlm.py \
+  --config configs/vlm/p_final_ecp.yaml \
+  --scenes scene-euro-citystrasbourg-scenariolatesession-00007_1 \
+  --frame-start 2550 \
+  --frame-end 2930 \
   --workers 1
 
 # to detach (before leaving SSH): ctrl+B -> D
-# reattach (after new SSH): tmux attach -t vespa
+# reattach (after new SSH): tmux attach -t VESPA
 # list running sessions
 tmux ls
 
 ################## mount disk (after reboot) ####################
-sudo mount /dev/sdb1 /media/lleba/ECP_Nuscenes_01
-
+sudo mount /dev/sde1 /media/lleba/ECP_Nuscenes_01
 
 ################### run evalutation for pseudo labels #####################
 cd /home/lleba/Thesis/Development/Evaluation
@@ -143,59 +155,115 @@ cd /home/lleba/Thesis/Development/Evaluation
 # convert pseudo labels into the correct submission JSON format for evaluation
 # probably already in correct format coming out of the autolabeling pipeline (this is the case for VESPA)
 # if not, run the following script
-conda run -n sam3 python submission/generate_submission.py \
+conda run -n autolabeling python submission/generate_submission.py \
   --split train \
   --mapping 8class \
   --out submissions/nuscenes_mini/submission_train_8class.json
 
 # or for when wanting to sanity check the evaluation pipeline with the GT labels as submission
 # nuscenes
-conda run -n sam3 python submission/make_gt_submission_nuscenes.py \
+conda run -n autolabeling python submissions/make_gt_submission_nuscenes.py \
   --split train \
-  --mapping 8class \
-  --out submissions/nuscenes_mini/gt_submission_train_8class.json
+  --mapping 1class \
+  --out submissions/nuscenes_mini/gt_submission_train_1class.json
 
 # ecp
-conda run -n sam3 python submission/make_gt_submission_ecp.py \
+conda run -n autolabeling python submissions/make_gt_submission_ecp.py \
   --split train \
-  --mapping 8class \
-  --out submissions/ecp/gt_submission_train_8class.json
+  --mapping 1class \
+  --out submissions/ecp/gt_submission_train_1class.json
 
 ## evaluation
 # then run the evaluation with the generated submission file, use the following command (adapt paths accordingly)
 # nuscenes
-conda run -n sam3 python evaluation.py \
+conda run -n autolabeling python evaluation.py \
   --dataset nuscenes \
-  --submission /home/lleba/VESPA/outs/vlm/p_final/#out_labels/vlm_p_final_train_8class.json \
-  --out_dir eval_results/nuscenes_mini/vespa_vlm_train_8class/ \
+  --submission /home/lleba/VESPA/outs/vlm/p_final/#out_labels/vlm_p_final_train_3class.json \
+  --out_dir eval_results/nuscenes_mini/vespa_vlm_train/3class/ \
   --plot_examples 10
 
-# ecp
-conda run -n sam3 python evaluation.py \
+# ecp (allows for multiple submission files to be evaluated at once, e.g. for different scenes, just add more paths to the --submission argument)
+conda run -n autolabeling python evaluation.py \
   --dataset ecp \
-  --submission /home/lleba/VESPA/outs/vlm/p_final_ecp/#out_labels/vlm_p_final_ecp_train_8class.json \
-  --out_dir eval_results/nuscenes_mini/vespa_vlm_train_8class/ \
+  --submission /home/lleba/VESPA/outs/vlm/p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00002_1/#out_labels/vlm_p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00002_1_train_8class.json /home/lleba/VESPA/outs/vlm/p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00003_1/#out_labels/vlm_p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00003_1_train_8class.json /home/lleba/VESPA/outs/vlm/p_final_ecp/scene-euro-citystrasbourg-scenariolatesessionn-00007_1/#out_labels/vlm_p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00007_1_train_8class.json \
+  --out_dir eval_results/ecp/vespa_vlm_train/8class/ \
   --plot_examples 10
+
+# or for the autolabeling pipeline output
+conda run -n autolabeling python evaluation.py \
+  --dataset ecp \
+  --submission /home/lleba/Thesis/Development/AutoLabeling/output/ecp/lidar_integration_option1/autolabel_ecp_annotated_8class.json \
+  --out_dir eval_results/ecp/autolabeling_lidar_integration_option1/8class/ \
+  --plot_examples 33
 
 # to run the ground truth sanity check evaluation, use the following command (adapt paths accordingly)
 # nuscenes
-conda run -n sam3 python evaluation.py \
+conda run -n autolabeling python evaluation.py \
   --dataset nuscenes \
-  --submission submissions/nuscenes_mini/gt_submission_train_8class.json \
-  --out_dir eval_results/nuscenes_mini/gt_sanity_train_8class/ \
+  --submission submissions/nuscenes_mini/gt_submission_train_1class.json \
+  --out_dir eval_results/nuscenes_mini/gt_sanity_train/1class/ \
   --plot_examples 10
 
 # ecp
-conda run -n sam3 python evaluation.py \
+conda run -n autolabeling python evaluation.py \
   --dataset ecp \
-  --submission submissions/ecp/gt_submission_train_8class.json \
-  --out_dir eval_results/ecp/gt_sanity_train_8class/ \
+  --submission submissions/ecp/gt_submission_train_3class.json \
+  --out_dir eval_results/ecp/gt_sanity_train/3class/ \
   --plot_examples 10
 
 ## report
 # generate evaluation report in a more compact form for better readability
 python make_eval_report.py \
-  --eval_dir eval_results/nuscenes_mini/vespa_vlm_train_8class/ \
-  --out_dir eval_results/nuscenes_mini/vespa_vlm_train_8class/
+  --eval_dir eval_results/nuscenes_mini/gt_sanity_train/1class/ \
+  --out_dir eval_results/nuscenes_mini/gt_sanity_train/1class/
 
 # for information on how evaluation is done, see README_evaluation.md
+
+################################ run jupyter notebook in web to see k3d plots ################################
+# in ssh terminal
+/home/lleba/miniconda3/envs/autolabeling/bin/jupyter lab --no-browser --port=8888
+
+# new terminal on local machine
+ssh -L 8888:localhost:8888 tud279182
+
+# in browser (add token from terminal output of jupyter lab command)
+http://localhost:8888/lab?token=<token>
+
+
+############################### run custom autolabeling pipeline ###############################
+cd /home/lleba/Thesis/Development/Autolabeling
+# if wanted from within a tmux session:
+# tmux new -s autolabeling
+# tmux attach -t autolabeling
+conda activate autolabeling
+
+# nuscenes (currently only runs on the annotated keyframes, not on all frames)
+python run_pipeline.py \
+  --config configs/nuscenes.yaml \
+  --split train \
+  --output-dir /home/lleba/Thesis/Development/AutoLabeling/output/nuscenes_mini/lidar_integration_option1
+
+# ecp
+python run_pipeline.py \
+  --config configs/ecp.yaml \
+  --scenes scene-euro-citystrasbourg-scenariolatesession-00007_1 \
+  --frame-start 2550 \
+  --frame-end 2930 \
+  --run-name ecp_scene00007 \
+  --no-checkpoint # if no checkpoints wanted
+
+# or all ecp gt scenes sequentially
+python run_pipeline.py --config configs/ecp.yaml \
+  --scenes scene-euro-citystrasbourg-scenariolatesession-00002_1 \
+  --frame-start 550 --frame-end 1340 && \
+python run_pipeline.py --config configs/ecp.yaml \
+  --scenes scene-euro-citystrasbourg-scenariolatesession-00003_1 && \
+python run_pipeline.py --config configs/ecp.yaml \
+  --scenes scene-euro-citystrasbourg-scenariolatesession-00007_1 \
+  --frame-start 2550 --frame-end 2930
+
+# to run only on the annotated frames
+python run_pipeline.py \
+  --config configs/ecp.yaml \
+  --annotated-only \
+  --output-dir /home/lleba/Thesis/Development/AutoLabeling/output/ecp/lidar_integration_option1

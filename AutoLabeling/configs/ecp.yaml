@@ -1,0 +1,63 @@
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset: ecp
+data_root: /media/lleba/ECP_Nuscenes_01/output2/ecp2nuscenes
+version: v1.0-trainval
+camera: CAM_FRONT
+split: train
+mapping_name: 8class
+
+# ── Output ────────────────────────────────────────────────────────────────────
+output_dir: /home/lleba/Thesis/Development/AutoLabeling/output/ecp
+
+# ── Model paths ───────────────────────────────────────────────────────────────
+models:
+  dev_root: /home/lleba/Thesis/Development
+  sam3_ckpt: null
+  sam3d_body_repo: null
+  sam3d_obj_cfg: null
+
+# ── Detection thresholds ──────────────────────────────────────────────────────
+thresholds:
+  sam3_score: 0.5
+  min_mask_px: 100
+  body_bbox: 0.8
+  sam3_iou_merge: 0.4
+
+# ── LiDAR / Pointmap mode ─────────────────────────────────────────────────────
+# Controls what depth information SAM3D Objects sees per frame.
+#   baseline       — dense MoGe relative-depth pointmap, no LiDAR (original pipeline)
+#   o1_lidar       — sparse metric LiDAR pointmap; NaN where no LiDAR hit
+#   o2_moge_affine — dense MoGe pointmap, globally calibrated to metric via
+#                    least-squares fit  Z_metric = a*Z_moge + b  on in-image LiDAR returns
+lidar:
+  pointmap_mode: baseline
+
+# ── Cross-class deduplication ─────────────────────────────────────────────────
+# When the same physical object is detected under two different prompts, the
+# lower-priority class is removed if mask IoU > iou_thresh.
+# Equal-priority pairs are kept as-is.  Raise a class's value to make it "win"
+# over others; lower it to make it more likely to be replaced.
+cross_class_dedup:
+  iou_thresh: 0.5
+  priority:                   # strictly unique — every pair has a definite winner
+    pedestrian:           0   # generic person
+    car:                  1   # generic vehicle
+    bicycle:              2   # bike frame only (rider handled by SAM3D Body + OBB merge)
+    truck:                3   # specific vehicle; beaten by bus / constr. / trailer
+    motorcycle:           4   # motorised rider > bicycle
+    trailer:              5   # more specific
+    bus:                  6   # large vehicle > truck
+    construction vehicle: 7   # heavy equipment and most specific
+
+# ── SAM3 prompts ──────────────────────────────────────────────────────────────
+# Note: 'bicycle and cyclist' split into 'bicycle' (objects) + 'pedestrian' (body).
+# Rider OBBs are merged with the bike OBB in post-processing (_merge_rider_obbs).
+prompts:
+  pedestrian:           body
+  car:                  objects
+  bicycle:              objects
+  motorcycle:           objects
+  bus:                  objects
+  truck:                objects
+  construction vehicle: objects
+  trailer:              objects

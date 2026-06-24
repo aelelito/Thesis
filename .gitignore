@@ -5,6 +5,8 @@
 *.bin
 *.safetensors
 *.onnx
+*.gz
+*.pkl
 
 # ── SAM3 / SAM3D third-party cloned repos (your notebooks at SAM3D/ are kept) ─
 SAM3D/sam-3d-body/

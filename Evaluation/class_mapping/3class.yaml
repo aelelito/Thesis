@@ -35,6 +35,7 @@ mapping_nuscenes:
   vehicle.emergency.police:             null
 
 # Maps ECP ground-truth category names → final detection class names.
+# Needed because the ECP GT uses different names than nuScenes
 mapping_ecp:
   car:                  "vehicle"
   truck:                "vehicle"
