@@ -260,21 +260,88 @@ Every option below benefits from denser LiDAR — temporal aggregation is a natu
 
 ---
 
-#### O4 — Depth completion as dense LiDAR backend
+#### O4 — Depth completion as dense LiDAR backend (network of choice: CompletionFormer)
 
 **What it is**: Instead of passing the raw sparse LiDAR as the pointmap, first run a **LiDAR depth completion** network. Depth completion takes your sparse LiDAR scan + the RGB image and fills in a dense depth map — every pixel gets a metrically grounded depth estimate. The completed dense depth map becomes the pointmap input.
 
-**Why this is better than O3**: O3 still relies on MoGe's relative depth structure and corrects it with a linear transform. Depth completion networks (CompletionFormer, PENet, etc.) are trained end-to-end to fuse sparse LiDAR geometry directly with RGB features — the LiDAR contributes geometry, not just a scale factor. The resulting depth maps preserve LiDAR accuracy at measurement locations and use image structure to interpolate between them. Crucially, the correction is per-pixel and locally faithful, learned from data, not hand-crafted.
+**Why this is better than O3**: O3 still relies on MoGe's relative depth structure and corrects it with a linear transform. Depth completion networks are trained end-to-end to fuse sparse LiDAR geometry directly with RGB features — the LiDAR contributes geometry, not just a scale factor. The resulting depth maps preserve LiDAR accuracy at measurement locations and use image structure to interpolate between them. Crucially, the correction is per-pixel and locally faithful, learned from data, not hand-crafted. This directly targets E5: for large close side-on vehicles, per-pixel LiDAR anchoring across the visible side surface grounds the depth gradient that MoGe was getting wrong.
 
-**What it improves**: Scale, localization, and (indirectly) shape — because the SS generator now has dense metric-scale depth information for every part of the image, not just where LiDAR happened to hit.
+**What it improves — effect on mesh and OBB**:
+- **Metric scale (dominant)**: mesh comes out at correct absolute size.
+- **Depth aspect ratio (secondary)**: the SS generator's voxel grid can extend correctly along the camera Z axis when the pointmap respects the true within-object depth spread. For E5 objects, this makes the mesh's front-to-back extent match reality instead of being compressed by MoGe's inaccurate within-object gradient. The mesh becomes longer in world coordinates (along the vehicle's own length axis after OBB fitting).
+- **Silhouette/category shape (minimal)**: the pointmap has minimal effect on whether the mesh looks like a sedan vs. van vs. truck — this is dominated by SAM 3D Objects' learned priors (the paper's own LVIS ablation reports 48/52 preference, i.e. essentially no shape effect). Don't expect qualitative silhouette changes; expect OBB dimensions and yaw to improve.
 
-**Implementation**: Write a `LiDARCompletionDepthModel` class that wraps a completion network (CompletionFormer, PENet, etc.) and matches the `depth_model` interface expected by `InferencePipelinePointMap.__init__`. The rest of the pipeline is unchanged.
+**Choice of completion network: CompletionFormer**
 
-**Code change**: New wrapper class (~50 lines). No changes to SAM3D Objects source.
+Alternatives considered:
+- **CompletionFormer** (Zhang et al., CVPR 2023) — chosen
+- **BP-Net** (Tang et al., CVPR 2024) — higher KITTI RMSE rank, deferred as first-line replacement if CFormer underperforms
+- **OGNI-DC** (Zuo & Deng, ECCV 2024) — stronger sparsity-robust generalisation, deferred as fallback if aggregation quality proves inconsistent
+- **MapAnything** — multi-view depth densification, used in AutoBox; deferred to a separate multi-view ablation phase
 
-**Temporal**: Denser LiDAR from temporal aggregation → completion network works better → better pointmap → better SS generation.
+Reasons for CompletionFormer over MapAnything (the main alternative):
 
-**Novelty**: Medium-high. Replaces a monocular guessing model with a sensor-fused one.
+1. **Single-camera scope of this pipeline stage**: the current pipeline processes one camera view at a time. MapAnything's core advantage is multi-view cross-camera attention across the 6-camera surround rig — this benefit is unavailable in the single-cam setting. Multi-view integration is deferred to a later ablation phase; when it comes, MapAnything is a natural fit for that separate comparison but should not be conflated with O4.
+
+2. **Locally faithful metric depth via per-pixel LiDAR anchoring**: MapAnything uses a single learnable scale token per scene, which is why AutoBox requires an additional per-instance percentile-based alignment post-hoc — MapAnything can be locally metric-inaccurate for individual objects. CompletionFormer treats projected LiDAR points as near-hard per-pixel constraints, producing locally faithful metric depth at every LiDAR anchor without a post-hoc alignment step. For E5-style close side-on vehicles, per-pixel LiDAR anchoring across the visible side surface is exactly the architectural bias needed.
+
+3. **Cleaner conceptual contrast with MoGe**: O2/O3 use MoGe (monocular relative depth) with a global or per-object affine correction. O4 with CompletionFormer occupies the same architectural slot (single-view depth model → dense pointmap) but swaps the depth model itself. This gives a clean ablation story: O2 vs O3 vs O4 all share the "single-view depth model" slot; only the model changes. Using MapAnything in O4 would additionally change the ablation to include multi-view integration, muddying the isolation of what causes any improvement.
+
+4. **Sparsity regime matches pretrained weights**: nuScenes provides ~1–2% pixel coverage from a single 32-beam sweep; with ±3 sweep aggregation (see "Pre-processing: Multi-Sweep LiDAR Aggregation" in `implementation_notes.md`) this rises to ~5–7%, closely matching KITTI's 5.9% coverage that CompletionFormer was trained on. KITTI pretrained checkpoints therefore operate in-distribution on the sparse-input side, minimising the need for domain-specific retraining before validating the approach end-to-end. This is a practical cost/risk argument, not a quality argument — but it matters for iteration speed.
+
+5. **Distinct from AutoBox**: AutoBox already demonstrates MapAnything in a multi-camera pseudo-labeling setup. Reusing MapAnything in O4 would dilute the contribution of this thesis. CompletionFormer positions O4 as a distinct densification route worth comparing against AutoBox rather than being a component of it.
+
+**Workflow**
+
+Because SAM 3D Objects consumes a full-image pointmap, depth completion runs **globally per camera view**, not per-object mask. The dense output naturally supports per-mask extraction downstream. Reasons for the global approach:
+- Depth completion networks are trained on full images and leverage scene-wide context (sky, ground plane, horizon lines, vanishing structure). Object crops lose this context and degrade quality.
+- One forward pass per camera view (~50–150 ms on modern GPU) is compute-efficient vs. N passes per view.
+- Preserves alignment with the MoGe pipeline: MoGe also produces a full-frame pointmap, so O4 becomes a drop-in slot replacement.
+
+Per-camera steps:
+
+1. **Temporal aggregation**: ±3 sweeps for nuScenes / ±2 for ECP, ego-motion compensated to anchor frame. Already implemented — see "Pre-processing: Multi-Sweep LiDAR Aggregation" in `implementation_notes.md`.
+
+2. **Global pre-filters**: ego-body exclusion zone, max BEV range 52 m. Already implemented — see "Pre-processing: Point Cloud Pre-filters" in `implementation_notes.md`.
+
+3. **Projection to camera view**: standard extrinsic + intrinsic projection. Where multiple aggregated points project to the same pixel (common with 5–7 sweeps), keep the **minimum depth per pixel** — this preserves the foreground surface at every pixel, since the camera can only see the closest surface and min is the only operation that guarantees foreground over background at occlusion boundaries. Average or max would produce depths that don't correspond to any real surface.
+
+    *Note on anchor-frame-only as an alternative*: using only the anchor sweep (N_BEFORE=N_AFTER=0) avoids any multi-sweep collision entirely and is guaranteed correct for dynamic objects at their exact timestamp. It is conceptually cleaner but gives ~1–2% pixel coverage on nuScenes (32-beam), well below the ~5.9% KITTI coverage that CompletionFormer was trained on, degrading completion quality at distance. The aggregated approach (~5–7% coverage) is preferred. Switching to N_BEFORE=N_AFTER=0 in the config is the easiest way to compare single-sweep vs. aggregated completion quality.
+
+4. **Parallax/occlusion filter** *(deferred — apply only if artifacts are observed)*: Because the LiDAR sits ~1.8 m above the cameras on the nuScenes vehicle, a LiDAR beam can bypass a foreground object and strike the background, but when projected into the camera image appears inside the foreground object's 2D mask. This creates a false background anchor for CompletionFormer inside that object's region.
+
+    In practice this is rare and CompletionFormer is more robust to isolated outliers than O3's affine fit (which is directly corrupted by a single bad point). The global pre-filters (ego-body exclusion, 52 m range) already suppress the most severe cases. **Skip this filter in the prototype** and add it only if visible boundary artifacts appear. If needed, reuse the existing `filter_inmask_lidar_hdbscan` utility per SAM3 mask — this is strictly stronger than the 1.5×median rule and is already implemented and tested. The filter is applied to the *sparse input depth map* before CompletionFormer, not to the completed output.
+
+5. **Depth completion forward pass**: `CompletionFormer(rgb_full, sparse_depth_full) → dense_depth (H, W)`.
+
+6. **Back-project to pointmap**: `p = d * K^{-1} * [u, v, 1]^T` per pixel → `(H, W, 3)` pointmap in camera frame. Convert to PyTorch3D (negate X, Y) → SAM 3D Objects input.
+
+7. **SAM 3D Objects inference**: standard call with `pointmap=<completed>`. No affine calibration step (depth is already metric). Masks gate which pixels contribute to which object mesh downstream.
+
+8. **(Optional) Post-completion mesh sanity**: HDBSCAN can still be applied to extracted mesh vertices per object to reject boundary artifacts from completion. Cheap post-hoc insurance.
+
+**Moving-object aggregation caveat**: For dynamic classes (car, truck, pedestrian, bicycle, motorcycle) the ±k sweeps smear across a spatial trail because ego-motion compensation cannot account for the object's own motion. In practice the smeared points from non-anchor sweeps project to *different* image pixels than the anchor-frame points (the object has moved), so pixel collisions are rare and the min-depth rule naturally prefers whichever sweep's point lands on a foreground surface. Class-aware aggregation (anchor-only inside dynamic masks, full aggregation elsewhere) is a deferred option if metrics regress.
+
+**Fallback chain for O4**:
+
+| Condition | Behaviour | Mode tag |
+|---|---|---|
+| No LiDAR in frame | Fall back to O3 (per-object local affine). | `o3_fallback` |
+| CompletionFormer produces mostly invalid depth (>50% pixels) | Fall back to O3 for that frame. | `o3_fallback` |
+| Normal | Use completed depth pointmap. | `o4_local` |
+
+**Expected wins and losses vs. O3**:
+- **Large close side-on vehicles (E5)**: significant improvement expected — per-pixel LiDAR anchoring directly grounds the depth gradient MoGe was getting wrong.
+- **Head-on vehicles at medium range**: roughly on par with O3 — O3's affine already works well when within-object depth is near-uniform.
+- **Distant sparse objects (>30 m)**: possibly worse than O3 — CompletionFormer with sparse anchors degrades toward monocular depth, whereas O3's affine can still lock a small number of LiDAR points to a good scale.
+
+Evaluation should stratify by object distance, view angle, and size class to isolate where O4 wins vs. where O3 wins. Depth-quality check against held-out LiDAR (removed from input, ~1000 pixels per frame, RMSE per range bin 0–15/15–30/30–50 m) is worth running before the full SAM 3D Objects end-to-end, so the depth quality is characterised independently of the downstream mesh generation.
+
+**Code change**: New wrapper class (~50–80 lines) — `LiDARCompletionDepthModel` matching the `depth_model` interface of `InferencePipelinePointMap`. Loads KITTI-pretrained CompletionFormer weights. Feeds (RGB, per-pixel sparse depth built from steps 1–4) → returns `(H, W, 3)` pointmap. No changes to SAM 3D Objects source. Detailed implementation, config values, and code paths to be added to `implementation_notes.md` once first working version is in place.
+
+**Temporal**: Denser LiDAR from temporal aggregation → completion network works better → better pointmap → better SS generation. Already leveraged via existing aggregation pre-processing.
+
+**Novelty**: Medium-high. Replaces a monocular depth estimator with a sensor-fused network; positioning as a distinct architectural slot from AutoBox's multi-view route (MapAnything) is part of the contribution.
 
 ---
 

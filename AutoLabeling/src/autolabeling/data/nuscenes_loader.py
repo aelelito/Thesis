@@ -49,8 +49,9 @@ class FrameRecord:
     frame_idx: int             # keyframe index within scene (0-based)
     # LiDAR fields — None when the dataset has no LIDAR_TOP channel
     lidar_path: Optional[str] = None
-    R_l2e: Optional[np.ndarray] = None   # (3, 3) float64  rotation LiDAR → ego
-    t_l2e: Optional[np.ndarray] = None   # (3,)   float64  translation LiDAR → ego
+    R_l2e: Optional[np.ndarray] = None      # (3, 3) float64  rotation LiDAR → ego
+    t_l2e: Optional[np.ndarray] = None      # (3,)   float64  translation LiDAR → ego
+    lidar_sd_token: Optional[str] = None    # sample_data token for LIDAR_TOP anchor sweep (enables multi-sweep aggregation)
 
     def load_images(self) -> Tuple[np.ndarray, np.ndarray]:
         """Load and return (img_rgb, img_bgr) as uint8 arrays. Called per-frame during inference."""
@@ -75,9 +76,10 @@ def _load_frame(nusc: NuScenes, sample_token: str, camera: str, frame_idx: int) 
     t_e2g = np.array(ego_pose['translation'], dtype=np.float64)
 
     # LiDAR calibration — only available when the dataset has LIDAR_TOP
-    lidar_path = None
-    R_l2e      = None
-    t_l2e      = None
+    lidar_path     = None
+    R_l2e          = None
+    t_l2e          = None
+    lidar_sd_token = None
     if 'LIDAR_TOP' in sample['data']:
         lidar_sd_token = sample['data']['LIDAR_TOP']
         lidar_sd       = nusc.get('sample_data', lidar_sd_token)
@@ -99,6 +101,7 @@ def _load_frame(nusc: NuScenes, sample_token: str, camera: str, frame_idx: int) 
         lidar_path=lidar_path,
         R_l2e=R_l2e,
         t_l2e=t_l2e,
+        lidar_sd_token=lidar_sd_token,
     )
 
 

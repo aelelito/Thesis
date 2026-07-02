@@ -13,8 +13,8 @@ output_dir: /home/lleba/Thesis/Development/AutoLabeling/output/ecp
 models:
   dev_root: /home/lleba/Thesis/Development
   sam3_ckpt: null
-  sam3d_body_repo: null
-  sam3d_obj_cfg: null
+  sam3d_body_repo: null      # null = <dev_root>/Models/SAM3D/sam-3d-body
+  sam3d_obj_cfg: null        # null = <dev_root>/Models/SAM3D/sam-3d-objects/checkpoints/hf/pipeline.yaml
 
 # ── Detection thresholds ──────────────────────────────────────────────────────
 thresholds:
@@ -23,14 +23,105 @@ thresholds:
   body_bbox: 0.8
   sam3_iou_merge: 0.4
 
-# ── LiDAR / Pointmap mode ─────────────────────────────────────────────────────
-# Controls what depth information SAM3D Objects sees per frame.
-#   baseline       — dense MoGe relative-depth pointmap, no LiDAR (original pipeline)
-#   o1_lidar       — sparse metric LiDAR pointmap; NaN where no LiDAR hit
-#   o2_moge_affine — dense MoGe pointmap, globally calibrated to metric via
-#                    least-squares fit  Z_metric = a*Z_moge + b  on in-image LiDAR returns
-lidar:
-  pointmap_mode: baseline
+# ── SAM3D Objects ──────────────────────────────────────────────────────────────
+# Controls what depth information SAM3D Objects sees per frame (pointmap input).
+#   baseline         — dense MoGe relative-depth pointmap, no LiDAR (original pipeline)
+#   o1_lidar         — sparse metric LiDAR pointmap; NaN where no LiDAR hit
+#   o2_moge_affine   — dense MoGe pointmap globally calibrated to metric via
+#                      least-squares fit  Z_metric = a*Z_moge + b  on in-image LiDAR returns
+#   o3_local_affine  — dense MoGe pointmap with a per-object affine fit; HDBSCAN isolates
+#                      each object's surface points, then fits a separate (a,b) per object
+sam3d_objects:
+  pointmap_mode: o3_local_affine
+  # HDBSCAN params for in-mask surface point isolation (O3 + B1).
+  # Tuned per class: smaller/sparser objects use tighter eps; large vehicles need
+  # a wider eps to merge subclusters across the body.  ECP has a 64-beam LiDAR
+  # so min_cluster_size can be slightly higher than the nuScenes defaults.
+  hdbscan:
+    pedestrian:
+      min_cluster_size: 3
+      min_samples: 1
+      cluster_eps: 0.20
+    bicycle:
+      min_cluster_size: 3
+      min_samples: 1
+      cluster_eps: 0.20
+    motorcycle:
+      min_cluster_size: 3
+      min_samples: 1
+      cluster_eps: 0.30
+    car:
+      min_cluster_size: 3
+      min_samples: 1
+      cluster_eps: 0.50
+    truck:
+      min_cluster_size: 5
+      min_samples: 1
+      cluster_eps: 0.60
+    construction vehicle:
+      min_cluster_size: 5
+      min_samples: 1
+      cluster_eps: 0.60
+    bus:
+      min_cluster_size: 5
+      min_samples: 1
+      cluster_eps: 0.80
+    trailer:
+      min_cluster_size: 5
+      min_samples: 1
+      cluster_eps: 0.70
+
+# ── LiDAR point cloud pre-filters ─────────────────────────────────────────────
+# Applied to the full ego-frame cloud after loading/aggregation, before camera
+# projection and any HDBSCAN in-mask clustering (B1 + O3).
+#
+# Ego-body filter: removes returns from the vehicle's own roof/windshield/mount.
+#   These sit at z ≈ 1.5–2 m in ego frame and become a dense strip after sweep
+#   aggregation; without filtering they can dominate HDBSCAN for nearby objects.
+#   Only points inside the box AND within the Z band are removed:
+#     |x| < ego_box_half_x  AND  |y| < ego_box_half_y
+#     AND  ego_box_z_min < z < ego_box_z_max
+#   (Z band preserves close ground-level returns and very tall objects above.)
+#
+# Max range filter: removes points beyond max_range_m BEV distance (sqrt(x²+y²)).
+#   Set 2 m above the 50 m evaluation limit to cut distant background returns
+#   that could form spurious HDBSCAN clusters inside far projected masks.
+#
+# Note: ECP uses a different sensor rig than nuScenes — ego box dims may need
+# tuning if the vehicle geometry differs significantly.
+lidar_filters:
+  use_ego_body_filter: true
+  ego_box_half_x: 4.0    # half-length fore/aft [m]
+  ego_box_half_y: 1.5    # half-width left/right [m]
+  ego_box_z_min:  0.5    # lower Z cutoff — preserves close ground returns [m]
+  ego_box_z_max:  2.5    # upper Z cutoff — preserves tall objects above [m]
+  max_range_m:   52.0    # BEV range cutoff (eval limit 50 m + 2 m margin) [m]
+
+# ── LiDAR aggregation ─────────────────────────────────────────────────────────
+# When use_aggregation=true, n_before + anchor + n_after sweeps are combined
+# after ego-motion compensation (all transformed to the anchor ego frame).
+# Denser point clouds improve B1/B2 corrections and O1/O2/O3 LiDAR pointmaps.
+# ECP uses a 64-beam LiDAR → single sweep is already dense; fewer extra sweeps needed.
+lidar_aggregation:
+  use_aggregation: true
+  n_before: 2      # sweeps before anchor keyframe
+  n_after: 2       # sweeps after anchor keyframe
+
+# ── SAM3D Body ─────────────────────────────────────────────────────────────────
+# Controls LiDAR-based post-inference correction for pedestrian meshes.
+#   baseline           — no correction; use SAM3D Body depth prediction as-is
+#   b1_lidar_correction — two-stage correction:
+#               Stage 1: override tz with HDBSCAN-filtered median in-mask LiDAR depth,
+#                        recompute tx/ty from mask centroid
+#               Stage 2: anchor mesh feet to ground via PseudoLabeler MLP
+#                        (fitted per frame on raw LiDAR; RANSAC fallback if fitting fails)
+sam3d_body:
+  correction_mode: b1_lidar_correction   # 'baseline' | 'b1_lidar_correction'
+  # B1:
+  #   Stage 1 — override tz with HDBSCAN-filtered median in-mask LiDAR depth,
+  #             recompute tx/ty from mask centroid.
+  #   Stage 2 — anchor mesh feet to local ground via PseudoLabeler MLP fitted
+  #             per frame on the raw LiDAR sweep (RANSAC global fallback if fitting fails).
 
 # ── Cross-class deduplication ─────────────────────────────────────────────────
 # When the same physical object is detected under two different prompts, the

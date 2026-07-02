@@ -133,7 +133,7 @@ class SAM3DBodyModel:
         faces = faces.astype(np.int32)
 
         results = []
-        for o in outputs:
+        for j, o in enumerate(outputs):
             verts  = np.asarray(o['pred_vertices'],     dtype=np.float32)
             joints = np.asarray(o['pred_keypoints_3d'], dtype=np.float32)
             cam_t  = np.asarray(o['pred_cam_t'],        dtype=np.float32)
@@ -142,6 +142,7 @@ class SAM3DBodyModel:
                 'faces':     faces,
                 'joints_3d': joints,
                 'cam_t':     cam_t,
+                'bbox':      merged[j],  # xyxy pixel bbox — used by B1 mask matching
                 'score':     1.0,   # SAM3D Body does not output a per-person confidence
             })
         return results

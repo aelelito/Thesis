@@ -64,7 +64,7 @@ from eval_patches import (
 
 # ── Dataset root ───────────────────────────────────────────────────────────────
 
-NUSCENES_ROOT    = Path('/media/lleba/nuScenes_mini')
+NUSCENES_ROOT    = Path('/media/lleba/ECP_Nuscenes_01/nuScenes_mini')
 NUSCENES_VERSION = 'v1.0-mini'
 
 # ── nuScenes instance (cached) ─────────────────────────────────────────────────

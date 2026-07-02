@@ -164,7 +164,7 @@ def main():
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
     from src.autolabeling.pipeline import run_pipeline
-    body_results, obj_results = run_pipeline(cfg, frames, checkpoint_dir=checkpoint_dir)
+    body_results, obj_results = run_pipeline(cfg, frames, checkpoint_dir=checkpoint_dir, nusc=nusc)
 
     # ── Write submission ───────────────────────────────────────────────────────
     # Always build 8class first, then derive 3class and 1class by remapping

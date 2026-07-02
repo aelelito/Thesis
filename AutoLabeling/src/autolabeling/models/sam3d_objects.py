@@ -2,13 +2,18 @@
 SAM3D Objects inference wrapper.
 
 Pointmap modes (set lidar.pointmap_mode in config):
-  'baseline'       — dense MoGe relative-depth pointmap (non-metric). Original pipeline.
-  'o1_lidar'       — sparse metric LiDAR pointmap. Requires FrameRecord.lidar_path;
-                     falls back to MoGe baseline if LiDAR is unavailable for a frame.
-  'o2_moge_affine' — dense MoGe pointmap calibrated to metric scale via a global affine
-                     fit  Z_metric = a*Z_moge + b  (least-squares on all in-image LiDAR
-                     returns). Falls back to unscaled MoGe if fewer than min_affine_pts
-                     LiDAR returns are available.
+  'baseline'         — dense MoGe relative-depth pointmap (non-metric). Original pipeline.
+  'o1_lidar'         — sparse metric LiDAR pointmap. Requires FrameRecord.lidar_path;
+                       falls back to MoGe baseline if LiDAR is unavailable for a frame.
+  'o2_moge_affine'   — dense MoGe pointmap calibrated to metric scale via a global affine
+                       fit  Z_metric = a*Z_moge + b  (least-squares on all in-image LiDAR
+                       returns). Falls back to unscaled MoGe if fewer than min_affine_pts
+                       LiDAR returns are available.
+  'o3_local_affine'  — dense MoGe pointmap with a per-object affine fit. For each detected
+                       object, HDBSCAN isolates its in-mask LiDAR surface points in 3D ego
+                       space, then fits a separate (a,b) for that object. The full-frame
+                       pointmap is rebuilt per object before each inference call. Falls back
+                       to global affine (O2) if too few clean in-mask points are available.
 """
 import gc
 import os
@@ -19,6 +24,7 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 
+from ..utils.lidar import filter_inmask_lidar_hdbscan
 from ..utils.logging_utils import suppress_output
 
 
@@ -31,6 +37,7 @@ class SAM3DObjectsModel:
         device: Optional[str] = None,
         pointmap_mode: str = 'baseline',   # 'baseline' | 'o1_lidar' | 'o2_moge_affine'
         min_affine_pts: int = 5,           # minimum LiDAR/MoGe pairs for a reliable affine fit
+        hdbscan_params: Optional[Dict] = None,  # per-class HDBSCAN params for O3
     ):
         self.repo_path       = str(repo_path)
         self.config_path     = str(config_path)
@@ -38,6 +45,7 @@ class SAM3DObjectsModel:
         self.device          = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         self.pointmap_mode   = pointmap_mode
         self.min_affine_pts  = min_affine_pts
+        self.hdbscan_params  = hdbscan_params or {}
         self._inference      = None
 
     def load(self) -> None:
@@ -90,34 +98,47 @@ class SAM3DObjectsModel:
         return ptmap, Z_map
 
     @staticmethod
-    def _project_lidar(frame, img_rgb: np.ndarray):
+    def _project_lidar(frame, img_rgb: np.ndarray, pts_ego: np.ndarray = None):
         """
         Project LiDAR sweep into camera frame.
 
-        Returns u_vis, v_vis (float pixel coords) and Z_vis (metric depth in metres)
-        for all LiDAR points that land inside the image and are in front of the camera.
-        Returns None, None, None if frame has no LiDAR.
+        Returns u_vis, v_vis (float pixel coords), Z_vis (metric depth in metres),
+        and pts_ego_vis (ego-frame XYZ) for all LiDAR points that land inside the
+        image and are in front of the camera.
+        Returns None, None, None, None if frame has no LiDAR.
+
+        Parameters
+        ----------
+        frame    : FrameRecord
+        img_rgb  : (H, W, 3) uint8 image (used only to get H, W)
+        pts_ego  : optional (N, 3) pre-loaded ego-frame point cloud (e.g. aggregated).
+                   If None, falls back to loading the single sweep from frame.lidar_path.
         """
-        if frame.lidar_path is None:
-            return None, None, None
+        if pts_ego is None:
+            if frame.lidar_path is None:
+                return None, None, None, None
+            pts_raw = np.fromfile(frame.lidar_path, dtype=np.float32).reshape(-1, 5)[:, :3]
+            pts_ego = (frame.R_l2e @ pts_raw.astype(np.float64).T).T + frame.t_l2e
 
         H, W   = img_rgb.shape[:2]
         K      = frame.K
         fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
 
-        pts_raw = np.fromfile(frame.lidar_path, dtype=np.float32).reshape(-1, 5)[:, :3]
-        pts_ego = (frame.R_l2e @ pts_raw.astype(np.float64).T).T + frame.t_l2e
         pts_cam = (frame.R_c2e.T @ (pts_ego - frame.t_c2e).T).T   # ego → camera (R3/OpenCV)
-
         Z_cam = pts_cam[:, 2]
         front = Z_cam > 0
         u = pts_cam[front, 0] / Z_cam[front] * fx + cx
         v = pts_cam[front, 1] / Z_cam[front] * fy + cy
         in_img = (u >= -0.5) & (u < W - 0.5) & (v >= -0.5) & (v < H - 0.5)
 
-        return u[in_img].astype(np.float32), v[in_img].astype(np.float32), Z_cam[front][in_img].astype(np.float32)
+        return (
+            u[in_img].astype(np.float32),
+            v[in_img].astype(np.float32),
+            Z_cam[front][in_img].astype(np.float32),
+            pts_ego[front][in_img].astype(np.float32),  # ego-frame coords (for HDBSCAN in O3)
+        )
 
-    def _compute_lidar_pointmap(self, frame, img_rgb: np.ndarray):
+    def _compute_lidar_pointmap(self, frame, img_rgb: np.ndarray, pts_ego: np.ndarray = None):
         """
         O1: build a sparse per-pixel LiDAR pointmap in PyTorch3D space.
         Pixels with no LiDAR return are NaN — the model fills gaps from image priors.
@@ -125,7 +146,7 @@ class SAM3DObjectsModel:
         Returns (H, W, 3) float32 or falls back to MoGe if no LiDAR available.
         """
         H, W = img_rgb.shape[:2]
-        u_vis, v_vis, Z_vis = self._project_lidar(frame, img_rgb)
+        u_vis, v_vis, Z_vis, _ = self._project_lidar(frame, img_rgb, pts_ego)
 
         if u_vis is None:
             print(f'    [warn] no LiDAR for {frame.scene_name} frame {frame.frame_idx}, '
@@ -146,7 +167,7 @@ class SAM3DObjectsModel:
         ptmap[v_int, u_int, 2] =  Z_vis   #  Z_cam → PyTorch3D Z
         return ptmap
 
-    def _compute_moge_affine_pointmap(self, frame, img_rgb: np.ndarray):
+    def _compute_moge_affine_pointmap(self, frame, img_rgb: np.ndarray, pts_ego: np.ndarray = None):
         """
         O2: dense MoGe pointmap with global affine calibration to metric scale.
 
@@ -173,7 +194,7 @@ class SAM3DObjectsModel:
         _, Z_moge = self._compute_moge_pointmap(img_rgb, frame.K)   # (H, W) relative
 
         # Step 2 — project LiDAR
-        u_vis, v_vis, Z_vis = self._project_lidar(frame, img_rgb)
+        u_vis, v_vis, Z_vis, _ = self._project_lidar(frame, img_rgb, pts_ego)
 
         if u_vis is None or len(u_vis) == 0:
             print(f'    [warn] no LiDAR for {frame.scene_name} frame {frame.frame_idx}, '
@@ -213,6 +234,101 @@ class SAM3DObjectsModel:
         Y_r3 = (v_grid - cy) * Z_metric / fy
         return np.stack([-X_r3, -Y_r3, Z_metric], axis=-1).astype(np.float32)
 
+    # ── O3 helpers ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fit_affine(Z_moge_vals, Z_lidar_vals, min_pts=4, z_min=0.5, z_max=80.0):
+        """Fit Z = a*Z_moge + b via least-squares. Returns (a, b) or None if too few points."""
+        valid = np.isfinite(Z_moge_vals) & (Z_lidar_vals > z_min) & (Z_lidar_vals < z_max)
+        if valid.sum() < min_pts:
+            return None
+        Z_m = Z_moge_vals[valid]
+        Z_l = Z_lidar_vals[valid]
+        A = np.stack([Z_m, np.ones_like(Z_m)], axis=1)
+        (a, b), _, _, _ = np.linalg.lstsq(A, Z_l, rcond=None)
+        return a, b
+
+    @staticmethod
+    def _build_ptmap_from_affine(Z_moge_map, K, a, b):
+        """Apply Z_metric = a*Z_moge + b to full map and build PyTorch3D pointmap."""
+        H, W = Z_moge_map.shape
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        Z_metric = np.maximum(a * Z_moge_map + b, 0.1).astype(np.float32)
+        u_grid, v_grid = np.meshgrid(np.arange(W, dtype=np.float32),
+                                      np.arange(H, dtype=np.float32))
+        X_r3 = (u_grid - cx) * Z_metric / fx
+        Y_r3 = (v_grid - cy) * Z_metric / fy
+        return np.stack([-X_r3, -Y_r3, Z_metric], axis=-1).astype(np.float32)
+
+    def _compute_local_affine_ptmap_for_object(
+        self, frame, Z_moge_map, pts_ego_vis, u_vis, v_vis, Z_vis, binary_mask,
+        min_cluster_size=3, min_samples=1, cluster_eps=0.5, min_pts=4,
+        z_min=0.5, z_max=80.0,
+    ):
+        """
+        O3: per-object MoGe + HDBSCAN local affine calibration.
+
+        MoGe runs once per frame (Z_moge_map shared); this method fits a separate
+        (a, b) for each object using only its clean in-mask LiDAR surface points.
+
+        Returns
+        -------
+        ptmap : (H, W, 3) float32  metric pointmap in PyTorch3D convention
+        a, b  : float  fitted affine coefficients
+        mode  : str    'local' | 'global_fallback' | 'unscaled_fallback'
+        """
+        H, W = Z_moge_map.shape
+        u_int = np.round(u_vis).astype(int).clip(0, W - 1)
+        v_int = np.round(v_vis).astype(int).clip(0, H - 1)
+
+        # Step 1 — find in-mask LiDAR points
+        in_mask    = binary_mask[v_int, u_int]
+        pts_inmask = pts_ego_vis[in_mask]
+        Z_inmask   = Z_vis[in_mask]
+        u_inmask   = u_vis[in_mask]
+        v_inmask   = v_vis[in_mask]
+        Z_moge_all = Z_moge_map[v_int, u_int]
+
+        if len(pts_inmask) < min_cluster_size:
+            ab = self._fit_affine(Z_moge_all, Z_vis, min_pts=min_pts,
+                                  z_min=z_min, z_max=z_max)
+            if ab is None:
+                return self._build_ptmap_from_affine(Z_moge_map, frame.K, 1.0, 0.0), 1.0, 0.0, 'unscaled_fallback'
+            return self._build_ptmap_from_affine(Z_moge_map, frame.K, *ab), ab[0], ab[1], 'global_fallback'
+
+        # Step 2 — HDBSCAN in 3D ego space (shared utility)
+        keep = filter_inmask_lidar_hdbscan(
+            pts_inmask,
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_eps=cluster_eps,
+        )
+
+        if keep is None:
+            ab = self._fit_affine(Z_moge_all, Z_vis, min_pts=min_pts,
+                                  z_min=z_min, z_max=z_max)
+            if ab is None:
+                return self._build_ptmap_from_affine(Z_moge_map, frame.K, 1.0, 0.0), 1.0, 0.0, 'unscaled_fallback'
+            return self._build_ptmap_from_affine(Z_moge_map, frame.K, *ab), ab[0], ab[1], 'global_fallback'
+
+        # Step 3 — fit affine on dominant cluster
+        u_clean_int = np.round(u_inmask[keep]).astype(int).clip(0, W - 1)
+        v_clean_int = np.round(v_inmask[keep]).astype(int).clip(0, H - 1)
+        Z_moge_clean = Z_moge_map[v_clean_int, u_clean_int]
+        Z_clean      = Z_inmask[keep]
+
+        ab = self._fit_affine(Z_moge_clean, Z_clean, min_pts=min_pts,
+                              z_min=z_min, z_max=z_max)
+        if ab is None:
+            ab = self._fit_affine(Z_moge_all, Z_vis, min_pts=min_pts,
+                                  z_min=z_min, z_max=z_max)
+            if ab is None:
+                return self._build_ptmap_from_affine(Z_moge_map, frame.K, 1.0, 0.0), 1.0, 0.0, 'unscaled_fallback'
+            return self._build_ptmap_from_affine(Z_moge_map, frame.K, *ab), ab[0], ab[1], 'global_fallback'
+
+        # Step 4 — apply to full frame
+        return self._build_ptmap_from_affine(Z_moge_map, frame.K, *ab), ab[0], ab[1], 'local'
+
     @staticmethod
     def _mesh_to_r3(output):
         """Convert SAM3D Objects output from object-local space to R3 camera space."""
@@ -250,19 +366,37 @@ class SAM3DObjectsModel:
 
     # ── Frame inference ───────────────────────────────────────────────────────
 
-    def run_frame(self, frame, frame_sam3: Dict[str, list]) -> list:
-        """Run pointmap computation + SAM3D Objects for all non-pedestrian detections."""
+    def run_frame(self, frame, frame_sam3: Dict[str, list], pts_ego: np.ndarray = None) -> list:
+        """
+        Run pointmap computation + SAM3D Objects for all non-pedestrian detections.
+
+        Parameters
+        ----------
+        frame      : FrameRecord
+        frame_sam3 : SAM3 segmentation results for this frame
+        pts_ego    : optional (N, 3) pre-loaded ego-frame point cloud (e.g. aggregated).
+                     If None, falls back to loading the single sweep from frame.lidar_path.
+        """
         img_rgb, _ = frame.load_images()
 
-        # Build pointmap according to configured mode
-        if self.pointmap_mode == 'o1_lidar':
-            ptmap = self._compute_lidar_pointmap(frame, img_rgb)
-        elif self.pointmap_mode == 'o2_moge_affine':
-            ptmap = self._compute_moge_affine_pointmap(frame, img_rgb)
-        else:   # 'baseline'
-            ptmap, _ = self._compute_moge_pointmap(img_rgb, frame.K)
+        # ── O3: MoGe runs once per frame; per-object affine computed inside the loop ──
+        if self.pointmap_mode == 'o3_local_affine':
+            _, Z_moge_map = self._compute_moge_pointmap(img_rgb, frame.K)
+            u_vis, v_vis, Z_vis, pts_ego_vis = self._project_lidar(frame, img_rgb, pts_ego)
+            if u_vis is None:
+                print(f'    [warn] no LiDAR for {frame.scene_name} frame {frame.frame_idx}, '
+                      f'falling back to unscaled MoGe for all objects.')
+            ptmap_t = None   # built per-object below
 
-        ptmap_t = torch.tensor(ptmap, dtype=torch.float32)
+        # ── All other modes: one pointmap for the whole frame ─────────────────────────
+        else:
+            if self.pointmap_mode == 'o1_lidar':
+                ptmap = self._compute_lidar_pointmap(frame, img_rgb, pts_ego)
+            elif self.pointmap_mode == 'o2_moge_affine':
+                ptmap = self._compute_moge_affine_pointmap(frame, img_rgb, pts_ego)
+            else:   # 'baseline'
+                ptmap, _ = self._compute_moge_pointmap(img_rgb, frame.K)
+            ptmap_t = torch.tensor(ptmap, dtype=torch.float32)
 
         results = []
         for prompt, pipeline_type in self.prompts.items():
@@ -275,8 +409,25 @@ class SAM3DObjectsModel:
                   f'"{prompt}": {len(dets)} instance(s)...')
             for d in dets:
                 try:
+                    if self.pointmap_mode == 'o3_local_affine':
+                        if u_vis is not None:
+                            _hp = self.hdbscan_params.get(prompt, {})
+                            ptmap_obj, a, b, mode = self._compute_local_affine_ptmap_for_object(
+                                frame, Z_moge_map, pts_ego_vis, u_vis, v_vis, Z_vis,
+                                d['binary_mask'],
+                                min_cluster_size=_hp.get('min_cluster_size', 3),
+                                min_samples=_hp.get('min_samples', 1),
+                                cluster_eps=_hp.get('cluster_eps', 0.5),
+                            )
+                            print(f'      [{mode}]  Z = {a:.4f}*Z_moge + {b:.4f}')
+                        else:
+                            ptmap_obj, _, _ = self._compute_moge_pointmap(img_rgb, frame.K)
+                        ptmap_t_use = torch.tensor(ptmap_obj, dtype=torch.float32)
+                    else:
+                        ptmap_t_use = ptmap_t
+
                     with suppress_output():
-                        out = self._inference(img_rgb, d['binary_mask'], seed=42, pointmap=ptmap_t)
+                        out = self._inference(img_rgb, d['binary_mask'], seed=42, pointmap=ptmap_t_use)
                     verts_r3, faces = self._mesh_to_r3(out)
                     results.append({
                         'vertices':    verts_r3,

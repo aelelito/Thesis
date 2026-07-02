@@ -178,8 +178,8 @@ conda run -n autolabeling python submissions/make_gt_submission_ecp.py \
 # nuscenes
 conda run -n autolabeling python evaluation.py \
   --dataset nuscenes \
-  --submission /home/lleba/VESPA/outs/vlm/p_final/#out_labels/vlm_p_final_train_3class.json \
-  --out_dir eval_results/nuscenes_mini/vespa_vlm_train/3class/ \
+  --submission /media/lleba/ECP_Nuscenes_01/autolabeling/output/nuscenes_mini/lidar_integration_objects_o3_body_baseline/autolabel_nuscenes_mini_train_1class.json \
+  --out_dir eval_results/nuscenes_mini/autolabeling_lidar_integration_objects_o3_body_baseline/1class/ \
   --plot_examples 10
 
 # ecp (allows for multiple submission files to be evaluated at once, e.g. for different scenes, just add more paths to the --submission argument)

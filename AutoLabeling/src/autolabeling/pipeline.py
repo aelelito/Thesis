@@ -23,19 +23,25 @@ Checkpoint layout
 
 Stage order
 -----------
-1. SAM3 segmentation     (all frames, GPU)
-2. SAM3D Body            (all frames, GPU, pedestrians)
-3. SAM3D Objects + MoGe  (all frames, GPU, all other classes)
-4. Orientation + OBB     (CPU, per frame)
+1. SAM3 segmentation           (all frames, GPU)
+2. SAM3D Body + B1 correction  (all frames, GPU + CPU)
+   - Stage 1: LiDAR tz correction (HDBSCAN per pedestrian)
+   - Stage 2: Ground anchoring (PseudoLabeler MLP fitted per frame)
+3. SAM3D Objects + MoGe        (all frames, GPU)
+4. Orientation + OBB           (CPU, per frame)
 """
-import gc
 import gzip
+import zlib
+import os
 import pickle
+import sys
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
+from sklearn.linear_model import RANSACRegressor
 from tqdm import tqdm
 
 from .fitting.obb import compute_obb_gravity_aligned, compute_obb_pedestrian
@@ -43,6 +49,13 @@ from .models.sam3_segmentor import SAM3Segmentor
 from .models.sam3d_body import SAM3DBodyModel
 from .models.sam3d_objects import SAM3DObjectsModel
 from .orientation.pedestrian import facing_direction
+from .utils.lidar import (
+    filter_inmask_lidar_hdbscan,
+    filter_lidar_pts,
+    load_lidar_pts,
+    load_lidar_pts_aggregated,
+    project_lidar_to_camera,
+)
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
@@ -63,7 +76,7 @@ def _load(path: Path):
     try:
         with gzip.open(path, 'rb') as f:
             return pickle.load(f)
-    except (EOFError, OSError, pickle.UnpicklingError) as e:
+    except (EOFError, OSError, pickle.UnpicklingError, zlib.error) as e:
         # Checkpoint was truncated mid-write (e.g. disk full). Delete it so
         # the frame is re-processed on the next run.
         print(f'  [warn] corrupt checkpoint {path.name} ({e}), deleting and re-processing.')
@@ -144,6 +157,221 @@ def _get_sam3(i: int, sam3_mem: dict, checkpoint_dir: Optional[Path]) -> dict:
     if checkpoint_dir is not None:
         return _sam3_from_ckpt(_load(_ckpt_path(checkpoint_dir, 'sam3', i)))
     return sam3_mem[i]
+
+
+# ── Ground estimation helpers (PseudoLabeler) ─────────────────────────────────
+
+_B2_RANSAC_Z_MIN    = -1.0
+_B2_RANSAC_Z_MAX    =  0.5
+_B2_RANSAC_RESIDUAL =  0.10
+
+
+def _fit_pseudolabeler(pts_ego: np.ndarray, device: str, dev_root: Path):
+    """
+    Fit a PseudoLabeler MLP on the raw LiDAR sweep for one frame.
+
+    The MLP learns gθ: R² → R  (x,y) → z, finding the ground surface using
+    an asymmetric loss (no ground labels needed).  Once fitted it can be queried
+    at any (x,y) via pl_model(xy_tensor).
+
+    Returns the fitted model in eval mode, or None if fitting fails / no pts.
+    """
+    _pl_path = str(dev_root / 'Models' / 'TerraSeg' / 'PseudoLabeler_scripts')
+    if _pl_path not in sys.path:
+        sys.path.insert(0, _pl_path)
+    from pseudolabeler_model import PseudoLabeler
+    from pseudolabeler_loss  import pseudolabeler_loss as _pl_loss
+
+    _dev     = torch.device(device)
+    pl_model = PseudoLabeler().to(_dev)
+    pl_model.train()
+
+    _pc = torch.tensor(pts_ego, dtype=torch.float32).to(_dev)
+    _pc = pl_model.remove_ego_points(_pc)
+    _pc = pl_model.preprocess_denoise_pc(_pc)
+    if len(_pc) == 0:
+        return None
+
+    print(f'    [PseudoLabeler] fitting on {len(_pc):,} pts...', end=' ', flush=True)
+    _opt = torch.optim.AdamW(pl_model.parameters(), lr=1e-2, weight_decay=1e-4)
+    _sch = torch.optim.lr_scheduler.ReduceLROnPlateau(_opt, mode='min', factor=0.5, patience=50)
+    _best_loss, _best_state, _no_improve, _ema = float('inf'), None, 0, None
+
+    for _step in range(2500):
+        _opt.zero_grad()
+        _pred = pl_model(_pc)
+        _loss = _pl_loss(_pred, _pc[:, 2])
+        _loss.backward()
+        torch.nn.utils.clip_grad_norm_(pl_model.parameters(), 5.0)
+        _opt.step()
+        _sch.step(_loss.item())
+        _ema = _loss.item() if _ema is None else 0.9 * _ema + 0.1 * _loss.item()
+        if _ema < _best_loss:
+            _best_loss  = _ema
+            _best_state = {k: v.detach().cpu() for k, v in pl_model.state_dict().items()}
+            _no_improve = 0
+        else:
+            _no_improve += 1
+            if _no_improve >= 150:
+                break
+
+    if _best_state:
+        pl_model.load_state_dict(_best_state)
+    pl_model.eval().to(_dev)
+    print(f'done  ({_step + 1} steps, loss={_best_loss:.5f})')
+    return pl_model
+
+
+# ── B1 — depth correction helpers ────────────────────────────────────────────
+
+def _best_sam3_mask(bbox, ped_dets,
+                    iou_thresh: float = 0.3) -> Optional[np.ndarray]:
+    """Return highest-IoU SAM3 mask for bbox, or None if below threshold."""
+    x1, y1, x2, y2 = bbox
+    best_mask, best_iou = None, iou_thresh
+    for d in ped_dets:
+        ys, xs = np.where(d['binary_mask'])
+        if len(xs) == 0:
+            continue
+        mx1, my1 = float(xs.min()), float(ys.min())
+        mx2, my2 = float(xs.max()), float(ys.max())
+        inter = max(0., min(x2, mx2) - max(x1, mx1)) * max(0., min(y2, my2) - max(y1, my1))
+        iou   = inter / ((x2-x1)*(y2-y1) + (mx2-mx1)*(my2-my1) - inter + 1e-8)
+        if iou > best_iou:
+            best_iou, best_mask = iou, d['binary_mask']
+    return best_mask
+
+
+def _apply_b1_depth_correction(body_results: list, frame, ped_dets: list,
+                                pts_ego_vis, u_vis, v_vis, Z_vis,
+                                H: int, W: int,
+                                hdbscan_kwargs: dict = None) -> None:
+    """
+    Stage 1: override tz for each pedestrian with HDBSCAN-filtered median LiDAR depth.
+    Recomputes tx, ty from mask centroid. Shifts vertices by delta; cam_t updated.
+    joints_3d are body-relative and are NOT shifted.
+    Modifies body_results in-place.
+    """
+    fx, fy, cx, cy = frame.K[0, 0], frame.K[1, 1], frame.K[0, 2], frame.K[1, 2]
+    u_int = np.round(u_vis).astype(int).clip(0, W - 1)
+    v_int = np.round(v_vis).astype(int).clip(0, H - 1)
+
+    for i, r in enumerate(body_results):
+        bbox = r.get('bbox')
+        mask = _best_sam3_mask(bbox, ped_dets) if bbox is not None else None
+
+        if mask is None:
+            if bbox is not None:
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                mask = np.zeros((H, W), dtype=bool)
+                mask[max(0, y1):min(H, y2+1), max(0, x1):min(W, x2+1)] = True
+                mask_src = 'bbox_rect'
+            else:
+                r['b1_mode'] = 'no_bbox'
+                continue
+        else:
+            mask_src = 'sam3_mask'
+
+        in_mask    = mask[v_int, u_int]
+        pts_inmask = pts_ego_vis[in_mask]
+        Z_inmask   = Z_vis[in_mask]
+
+        if len(pts_inmask) == 0:
+            r['b1_mode'] = 'no_lidar'
+            continue
+
+        keep    = filter_inmask_lidar_hdbscan(pts_inmask, **(hdbscan_kwargs or {}))
+        tz_pred = float(r['cam_t'][2])
+
+        if keep is None:
+            tz_lidar = float(np.percentile(Z_inmask, 15))
+            b1_mode  = f'{mask_src}+p15_fallback'
+        else:
+            tz_lidar = float(np.median(Z_inmask[keep]))
+            b1_mode  = f'{mask_src}+hdbscan'
+
+        ys, xs = np.where(mask)
+        u_cen  = float(xs.mean())
+        v_cen  = float(ys.mean())
+        tx_new = (u_cen - cx) / fx * tz_lidar
+        ty_new = (v_cen - cy) / fy * tz_lidar
+
+        cam_t_new     = np.array([tx_new, ty_new, tz_lidar], dtype=np.float32)
+        delta         = cam_t_new - r['cam_t']
+        r['vertices'] = r['vertices'] + delta[None, :]
+        r['cam_t']    = cam_t_new
+        r['b1_mode']  = b1_mode
+        print(f'    [B1-tz ] ped {i}: {tz_pred:.2f}→{tz_lidar:.2f} m  [{b1_mode}]')
+
+
+# ── B2 — ground anchoring ─────────────────────────────────────────────────────
+
+def _apply_b2_ground_anchoring(body_results: list, frame,
+                                pts_ego: np.ndarray,
+                                pl_model, device: str,
+                                _stats: Optional[list] = None) -> None:
+    """
+    Stage 2: shift each pedestrian mesh so its lowest vertex sits on the ground.
+
+    Primary path  (pl_model not None): query fitted PseudoLabeler MLP at ped (x,y).
+    Fallback      (pl_model is None):  global RANSAC plane on raw LiDAR.
+    joints_3d are body-relative and are NOT shifted.
+    Modifies body_results in-place.
+    """
+    R_c2e, t_c2e = frame.R_c2e, frame.t_c2e
+    _dev          = torch.device(device)
+    _ransac       = None   # lazy-init only if needed
+
+    def _get_z_ransac(ped_xy):
+        nonlocal _ransac
+        if _ransac is None:
+            pts_f   = pts_ego.astype(np.float64)
+            g_cands = pts_f[(pts_f[:, 2] >= _B2_RANSAC_Z_MIN) &
+                            (pts_f[:, 2] <= _B2_RANSAC_Z_MAX)]
+            _ransac = RANSACRegressor(min_samples=3,
+                                      residual_threshold=_B2_RANSAC_RESIDUAL,
+                                      max_trials=500, random_state=42)
+            _ransac.fit(g_cands[:, :2], g_cands[:, 2])
+        return float(_ransac.predict([ped_xy])[0]), 'ransac_global'
+
+    for i, r in enumerate(body_results):
+        cam_t_ego = R_c2e @ r['cam_t'].astype(np.float64) + t_c2e
+        ped_xy    = cam_t_ego[:2]
+
+        if pl_model is not None:
+            try:
+                xy_t = torch.tensor([[ped_xy[0], ped_xy[1]]],
+                                    dtype=torch.float32).to(_dev)
+                with torch.no_grad():
+                    z_ground = float(pl_model(xy_t).item())
+                method = 'pseudolabeler'
+            except Exception as e:
+                print(f'    [B2] ped {i}: PseudoLabeler query failed ({e}), '
+                      f'falling back to RANSAC.')
+                z_ground, method = _get_z_ransac(ped_xy)
+        else:
+            z_ground, method = _get_z_ransac(ped_xy)
+
+        verts_ego = (R_c2e @ r['vertices'].astype(np.float64).T).T + t_c2e
+        z_foot    = float(verts_ego[:, 2].min())
+        z_shift   = z_ground - z_foot
+
+        delta_cam     = (R_c2e.T @ np.array([0., 0., z_shift])).astype(np.float32)
+        r['vertices'] = r['vertices'] + delta_cam[None, :]
+        r['cam_t']    = r['cam_t']    + delta_cam
+        r['b2_mode']  = method
+        print(f'    [B2] ped {i}: foot={z_foot:.2f}→ground={z_ground:.2f} m  '
+              f'shift={z_shift:+.2f} m  [{method}]')
+        if _stats is not None:
+            _stats.append({
+                'frame_idx':     frame.frame_idx,
+                'scene':         frame.scene_name,
+                'ped_idx':       i,
+                'z_foot_before': round(z_foot, 4),
+                'z_ground':      round(z_ground, 4),
+                'z_shift':       round(z_shift, 4),
+                'method':        method,
+            })
 
 
 # ── Postprocess (CPU) ─────────────────────────────────────────────────────────
@@ -228,13 +456,16 @@ def _merge_rider_obbs(
         corners, center, dims, yaw = compute_obb_gravity_aligned(
             combined, frame.R_c2e, frame.t_c2e, ground_z=None
         )
-        or_['vertices']    = combined
+        # OBB is fitted to combined vertices; individual meshes are kept separate
+        or_['rider_vertices'] = br['vertices']
+        or_['rider_faces']    = br['faces']
         or_['obb_corners'] = corners
         or_['obb_center']  = center
         or_['obb_dims']    = dims
         or_['obb_yaw']     = yaw
         body_used.add(bi)
-        print(f'    [rider merge] pedestrian → "{or_["prompt"]}"  (d={best_d:.2f} m)')
+        print(f'    [rider merge] {frame.scene_name} frame {frame.frame_idx}: '
+              f'pedestrian → "{or_["prompt"]}"  (d={best_d:.2f} m)')
 
     new_body = [br for bi, br in enumerate(body_list) if bi not in body_used]
     return new_body, obj_list
@@ -247,6 +478,7 @@ def run_pipeline(
     frames: list,
     device: Optional[str] = None,
     checkpoint_dir: Optional[Path] = None,
+    nusc=None,
 ) -> tuple:
     """
     Run the full auto-labeling pipeline on a list of FrameRecords.
@@ -257,6 +489,7 @@ def run_pipeline(
     frames         : list of FrameRecord  (images NOT pre-loaded)
     device         : override device; defaults to 'cuda' if available
     checkpoint_dir : directory for per-frame checkpoints; None = no checkpointing
+    nusc           : NuScenes instance; required when lidar_aggregation.use_aggregation=true
 
     Returns
     -------
@@ -269,10 +502,63 @@ def run_pipeline(
     dev_root     = Path(cfg.models.dev_root)
     sam3_ckpt    = cfg.models.sam3_ckpt or _hf_download_sam3()
     body_repo    = (Path(cfg.models.sam3d_body_repo) if cfg.models.sam3d_body_repo
-                    else dev_root / 'SAM3D' / 'sam-3d-body')
+                    else dev_root / 'Models' / 'SAM3D' / 'sam-3d-body')
     obj_cfg_path = (Path(cfg.models.sam3d_obj_cfg) if cfg.models.sam3d_obj_cfg
-                    else dev_root / 'SAM3D' / 'sam-3d-objects' / 'checkpoints' / 'hf' / 'pipeline.yaml')
+                    else dev_root / 'Models' / 'SAM3D' / 'sam-3d-objects' / 'checkpoints' / 'hf' / 'pipeline.yaml')
     obj_repo     = obj_cfg_path.parent.parent.parent
+
+    # ── LiDAR aggregation config ──────────────────────────────────────────────
+    _agg_cfg      = getattr(cfg, 'lidar_aggregation', None)
+    _use_agg      = bool(getattr(_agg_cfg, 'use_aggregation', False)) if _agg_cfg else False
+    _n_before     = int(getattr(_agg_cfg, 'n_before', 0)) if _agg_cfg else 0
+    _n_after      = int(getattr(_agg_cfg, 'n_after',  0)) if _agg_cfg else 0
+    if _use_agg and nusc is None:
+        print('  [warn] lidar_aggregation.use_aggregation=true but nusc=None — '
+              'falling back to single-sweep loading.')
+        _use_agg = False
+
+    # ── LiDAR point cloud pre-filters ─────────────────────────────────────────
+    _flt_cfg            = getattr(cfg, 'lidar_filters', None)
+    _use_ego_filter     = bool(getattr(_flt_cfg, 'use_ego_body_filter', True))  if _flt_cfg else True
+    _ego_box_half_x     = float(getattr(_flt_cfg, 'ego_box_half_x',     4.0))  if _flt_cfg else 4.0
+    _ego_box_half_y     = float(getattr(_flt_cfg, 'ego_box_half_y',     1.5))  if _flt_cfg else 1.5
+    _ego_box_z_min      = float(getattr(_flt_cfg, 'ego_box_z_min',      0.5))  if _flt_cfg else 0.5
+    _ego_box_z_max      = float(getattr(_flt_cfg, 'ego_box_z_max',      2.5))  if _flt_cfg else 2.5
+    _max_range_m        = float(getattr(_flt_cfg, 'max_range_m',        52.0)) if _flt_cfg else 52.0
+
+    def _load_pts_ego(frame) -> 'Optional[np.ndarray]':
+        """Load ego-frame point cloud for a frame (aggregated or single sweep),
+        then apply ego-body exclusion and max-range pre-filters."""
+        if _use_agg:
+            pts = load_lidar_pts_aggregated(nusc, frame, _n_before, _n_after)
+        else:
+            pts = load_lidar_pts(frame)
+        if pts is not None:
+            pts = filter_lidar_pts(
+                pts,
+                use_ego_body_filter=_use_ego_filter,
+                ego_box_half_x=_ego_box_half_x,
+                ego_box_half_y=_ego_box_half_y,
+                ego_box_z_min=_ego_box_z_min,
+                ego_box_z_max=_ego_box_z_max,
+                max_range_m=_max_range_m,
+            )
+        return pts
+
+    # ── HDBSCAN params (shared by B1 body correction and O3 objects) ─────────
+    _hdbscan_ns    = getattr(getattr(cfg, 'sam3d_objects', None), 'hdbscan', None)
+    hdbscan_params = (
+        {k: vars(v) for k, v in vars(_hdbscan_ns).items()}
+        if _hdbscan_ns is not None else {}
+    )
+
+    # ── SAM3D Body config ─────────────────────────────────────────────────────
+    _body_cfg        = getattr(cfg, 'sam3d_body', None)
+    _b1_enabled      = (getattr(_body_cfg, 'correction_mode', 'baseline') == 'b1_lidar_correction') \
+                       if _body_cfg else False
+    _b2_enabled      = _b1_enabled   # Stage 2 always runs together with B1
+    _body_mode_label = 'B1 — LiDAR depth + PseudoLabeler ground anchoring' \
+                       if _b1_enabled else 'baseline'
 
     # sam3_mem is only populated when checkpointing is disabled (fits in RAM).
     # When checkpointing is enabled, each stage loads results per-frame from disk.
@@ -328,7 +614,7 @@ def run_pipeline(
     _print_gpu(device)
 
     # ── SAM3D Body ────────────────────────────────────────────────────────────
-    print('\n[SAM3D Body]')
+    print(f'\n[SAM3D Body — {_body_mode_label}]')
     body_results = {}
     pending = []
     for i, frame in enumerate(frames):
@@ -355,29 +641,65 @@ def run_pipeline(
             device=device,
         )
         body_model.load()
+        # # ── [DEBUG] Ground anchoring stats ────────────────────────────────────
+        # _gnd_stats: list = []
+        # # ──────────────────────────────────────────────────────────────────────
         bar = tqdm(pending, total=len(frames), initial=len(frames) - len(pending),
                    desc='SAM3D Body', unit='frame')
         for i, frame in bar:
             bar.set_postfix_str(f'{frame.scene_name}  frame {frame.frame_idx}')
-            ped_dets = _get_sam3(i, sam3_mem, checkpoint_dir).get('pedestrian', [])
-            result = body_model.run_frame(frame, ped_dets)
+            frame_sam3 = _get_sam3(i, sam3_mem, checkpoint_dir)
+            ped_dets   = frame_sam3.get('pedestrian', [])
+            result     = body_model.run_frame(frame, ped_dets)
+
+            # ── B1: depth correction + ground anchoring ───────────────────────
+            if _b1_enabled and result and frame.lidar_path is not None:
+                pts_ego = _load_pts_ego(frame)
+                if pts_ego is not None:
+                    pts_ego_vis, u_vis, v_vis, Z_vis, H, W = project_lidar_to_camera(
+                        frame, pts_ego
+                    )
+                    _apply_b1_depth_correction(
+                        result, frame, ped_dets,
+                        pts_ego_vis, u_vis, v_vis, Z_vis, H, W,
+                        hdbscan_kwargs=hdbscan_params.get('pedestrian'),
+                    )
+                    if _b2_enabled:
+                        pl_model = _fit_pseudolabeler(pts_ego, device, dev_root)
+                        _apply_b2_ground_anchoring(
+                            result, frame, pts_ego, pl_model, device,
+                            # _stats=_gnd_stats,   # [DEBUG]
+                        )
+            # ─────────────────────────────────────────────────────────────────
+
             body_results[i] = result
             p = _ckpt_path(checkpoint_dir, 'body', i)
             if p:
                 _save(p, _body_to_ckpt(result))
         body_model.unload()
+        # # ── [DEBUG] Write ground anchoring stats ───────────────────────────────
+        # if _gnd_stats and getattr(cfg, 'output_dir', None) is not None:
+        #     import json
+        #     _stats_path = (checkpoint_dir.parent if checkpoint_dir is not None
+        #                    else Path(cfg.output_dir)) / 'ground_anchoring_stats.json'
+        #     _stats_path.parent.mkdir(parents=True, exist_ok=True)
+        #     with open(_stats_path, 'w') as _f:
+        #         json.dump(_gnd_stats, _f, indent=2)
+        #     print(f'  [DEBUG] Ground anchoring stats → {_stats_path}  ({len(_gnd_stats)} entries)')
+        # # ──────────────────────────────────────────────────────────────────────
     else:
         print(f'  All {len(frames)} frame(s) loaded from cache.')
 
     _print_gpu(device)
 
     # ── SAM3D Objects ─────────────────────────────────────────────────────────
-    _lidar_cfg   = getattr(cfg, 'lidar', None)
+    _lidar_cfg    = getattr(cfg, 'sam3d_objects', None)
     pointmap_mode = getattr(_lidar_cfg, 'pointmap_mode', 'baseline')
     _mode_labels = {
-        'baseline':       'MoGe baseline (non-metric)',
-        'o1_lidar':       'O1 — sparse LiDAR pointmap',
-        'o2_moge_affine': 'O2 — MoGe + global affine calibration',
+        'baseline':        'MoGe baseline (non-metric)',
+        'o1_lidar':        'O1 — sparse LiDAR pointmap',
+        'o2_moge_affine':  'O2 — MoGe + global affine calibration',
+        'o3_local_affine': 'O3 — MoGe + per-object local affine calibration',
     }
     print(f'\n[SAM3D Objects — {_mode_labels.get(pointmap_mode, pointmap_mode)}]')
     obj_results = {}
@@ -403,6 +725,7 @@ def run_pipeline(
             prompts=vars(cfg.prompts),
             device=device,
             pointmap_mode=pointmap_mode,
+            hdbscan_params=hdbscan_params,
         )
         obj_model.load()
         bar = tqdm(pending, total=len(frames), initial=len(frames) - len(pending),
@@ -410,7 +733,8 @@ def run_pipeline(
         for i, frame in bar:
             bar.set_postfix_str(f'{frame.scene_name}  frame {frame.frame_idx}')
             frame_sam3 = _get_sam3(i, sam3_mem, checkpoint_dir)
-            result = obj_model.run_frame(frame, frame_sam3)
+            pts_ego = _load_pts_ego(frame) if frame.lidar_path is not None else None
+            result = obj_model.run_frame(frame, frame_sam3, pts_ego=pts_ego)
             obj_results[i] = result
             p = _ckpt_path(checkpoint_dir, 'objects', i)
             if p:
