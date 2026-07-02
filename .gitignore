@@ -8,10 +8,12 @@
 *.gz
 *.pkl
 
-# ── SAM3 / SAM3D third-party cloned repos (your notebooks at SAM3D/ are kept) ─
-SAM3D/sam-3d-body/
-SAM3D/sam-3d-objects/
-SAM3D/detectron2/
+# ── SAM3 / SAM3D / TerraSeg third-party cloned repos (your notebooks at SAM3D/ are kept) ─
+Models/SAM3D/sam-3d-body/
+Models/SAM3D/sam-3d-objects/
+Models/SAM3D/detectron2/
+Models/TerraSeg
+Models/CompletionFormer
 .claude
 
 # ── Evaluation results & generated submissions ────────────────────────────────
