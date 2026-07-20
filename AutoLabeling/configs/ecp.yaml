@@ -31,8 +31,32 @@ thresholds:
 #                      least-squares fit  Z_metric = a*Z_moge + b  on in-image LiDAR returns
 #   o3_local_affine  — dense MoGe pointmap with a per-object affine fit; HDBSCAN isolates
 #                      each object's surface points, then fits a separate (a,b) per object
+#   o4_ground_filter — CompletionFormer + global PseudoLabeler ground filter before sparse anchors
+#   o5_mask_hdbscan  — CompletionFormer + per-mask HDBSCAN anchor cleaning (no ground filter)
 sam3d_objects:
-  pointmap_mode: o3_local_affine
+  pointmap_mode: o1_lidar
+  # O4/O5 settings — used when pointmap_mode is o4_ground_filter or o5_mask_hdbscan
+  cformer_ckpt: /home/lleba/Thesis/Development/Models/CompletionFormer/checkpoints/KITTIDC/KITTIDC_L1L2.pt
+  lidar_lines: 64      # ECP: 64-beam LiDAR
+  # SS Correction: mid-pipeline voxel occupancy correction using CFormer depth map.
+  # Requires pointmap_mode in (o4_ground_filter, o5_mask_hdbscan). Strict no-op when false.
+  # Run naming appends _sscorr when true.
+  ss_correction: false
+  # Hull anchoring: post-CFormer per-mask depth clamp.
+  # Inside each mask's convex hull, dense_depth = max(dense_depth, min_lidar_depth)
+  # where min_lidar_depth = min cam-depth of the dominant HDBSCAN cluster.
+  # Prevents occluder (pole/sign) LiDAR depth from bleeding into object interiors.
+  # Only active when pointmap_mode is o4_ground_filter or o5_mask_hdbscan.
+  hull_anchoring: true
+  # O5 proximity selection: when two large clusters both have ≥ proximity_min_pts pts
+  # and the second is ≥ proximity_ratio × largest, pick the CLOSER one in ego space.
+  proximity_min_pts: 30
+  proximity_ratio: 0.70
+  # O4 ground filter: max height above predicted road surface to classify a LiDAR
+  # point as a ground return (removed before CFormer sparse anchors).  Not used by
+  # B2 — B2 queries PseudoLabeler directly for ground height, no threshold needed.
+  # Model default is 0.40 m (semantic labeling); 0.10 m keeps bicycle frames / bumpers.
+  pl_ground_inlier_thres: 0.10   # m
   # HDBSCAN params for in-mask surface point isolation (O3 + B1).
   # Tuned per class: smaller/sparser objects use tighter eps; large vehicles need
   # a wider eps to merge subclusters across the body.  ECP has a 64-beam LiDAR

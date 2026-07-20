@@ -192,33 +192,67 @@ def _fit_pseudolabeler(pts_ego: np.ndarray, device: str, dev_root: Path):
     if len(_pc) == 0:
         return None
 
+    _n_steps  = 2500
+    _n_warmup = 200   # steps before early stopping kicks in — avoids the random-init
+                      # baseline: pred≈0 at init is already a decent ground approx,
+                      # so loss_0 is low; lr=1e-2 overshoots on step 1 and loss rises
+                      # for ~100-200 steps before dropping below loss_0.  The warmup
+                      # window lets the optimizer pass through that noisy phase first.
+    _patience = 300   # stop if loss hasn't improved for this many steps after warmup
     print(f'    [PseudoLabeler] fitting on {len(_pc):,} pts...', end=' ', flush=True)
     _opt = torch.optim.AdamW(pl_model.parameters(), lr=1e-2, weight_decay=1e-4)
-    _sch = torch.optim.lr_scheduler.ReduceLROnPlateau(_opt, mode='min', factor=0.5, patience=50)
-    _best_loss, _best_state, _no_improve, _ema = float('inf'), None, 0, None
+    _sch = torch.optim.lr_scheduler.CosineAnnealingLR(_opt, T_max=_n_steps, eta_min=1e-4)
+    _best_loss, _best_state, _no_improve = float('inf'), None, 0
 
-    for _step in range(2500):
+    for _step in range(_n_steps):
         _opt.zero_grad()
         _pred = pl_model(_pc)
         _loss = _pl_loss(_pred, _pc[:, 2])
+        _l = _loss.item()
+        # Only track best and count patience AFTER warmup.  Reason: random init gives
+        # pred≈0, and for flat terrain (nuScenes) ground is also near z=0, so loss_0 is
+        # accidentally low.  If we track from step 0, the step-1 overshoot (lr=1e-2)
+        # raises loss above loss_0 and the recovered model never beats it — patience
+        # fires at exactly warmup+patience steps.  By delaying tracking to post-warmup,
+        # best_loss is set from the actual trained state (step >= 200), not random init.
+        if _step >= _n_warmup:
+            if _l < _best_loss:
+                _best_loss  = _l
+                _best_state = {k: v.detach().cpu() for k, v in pl_model.state_dict().items()}
+                _no_improve = 0
+            else:
+                _no_improve += 1
+                if _no_improve >= _patience:
+                    break
         _loss.backward()
         torch.nn.utils.clip_grad_norm_(pl_model.parameters(), 5.0)
         _opt.step()
-        _sch.step(_loss.item())
-        _ema = _loss.item() if _ema is None else 0.9 * _ema + 0.1 * _loss.item()
-        if _ema < _best_loss:
-            _best_loss  = _ema
-            _best_state = {k: v.detach().cpu() for k, v in pl_model.state_dict().items()}
-            _no_improve = 0
-        else:
-            _no_improve += 1
-            if _no_improve >= 150:
-                break
+        _sch.step()
 
     if _best_state:
         pl_model.load_state_dict(_best_state)
     pl_model.eval().to(_dev)
-    print(f'done  ({_step + 1} steps, loss={_best_loss:.5f})')
+    print(f'done  (loss={_best_loss:.5f}, steps={_step + 1})')
+    return pl_model
+
+
+def _restore_pseudolabeler(state_dict: Optional[dict], device: str, dev_root: Path):
+    """
+    Reconstruct a PseudoLabeler from a cached state_dict.
+
+    Returns None if state_dict is None (fitting failed or not needed for this frame).
+    Ensures the PseudoLabeler module is importable by adding the scripts path to sys.path.
+    """
+    if state_dict is None:
+        return None
+    _pl_path = str(dev_root / 'Models' / 'TerraSeg' / 'PseudoLabeler_scripts')
+    if _pl_path not in sys.path:
+        sys.path.insert(0, _pl_path)
+    from pseudolabeler_model import PseudoLabeler
+    _dev     = torch.device(device)
+    pl_model = PseudoLabeler().to(_dev)
+    pl_model.load_state_dict({k: v.to(_dev) for k, v in state_dict.items()})
+    pl_model.eval()
     return pl_model
 
 
@@ -560,9 +594,26 @@ def run_pipeline(
     _body_mode_label = 'B1 — LiDAR depth + PseudoLabeler ground anchoring' \
                        if _b1_enabled else 'baseline'
 
+    # ── SAM3D Objects / PseudoLabeler config ──────────────────────────────────
+    _lidar_cfg_pre       = getattr(cfg, 'sam3d_objects', None)
+    _pointmap_mode_pre   = getattr(_lidar_cfg_pre, 'pointmap_mode', 'baseline')
+    _pl_ground_inlier    = float(getattr(_lidar_cfg_pre, 'pl_ground_inlier_thres', 0.10))
+    _proximity_min_pts   = int(float(getattr(_lidar_cfg_pre, 'proximity_min_pts', 30)))
+    _proximity_ratio     = float(getattr(_lidar_cfg_pre, 'proximity_ratio', 0.70))
+    _hull_anchoring      = bool(getattr(_lidar_cfg_pre, 'hull_anchoring', False))
+    # PseudoLabeler is needed when B2 ground anchoring is active OR when O4 uses
+    # ground filtering before CompletionFormer sparse anchors.
+    # O5 does NOT need PseudoLabeler — per-mask HDBSCAN handles ground clutter implicitly.
+    _needs_pseudolabeler = _b2_enabled or (_pointmap_mode_pre == 'o4_ground_filter')
+
     # sam3_mem is only populated when checkpointing is disabled (fits in RAM).
     # When checkpointing is enabled, each stage loads results per-frame from disk.
     sam3_mem = {}
+
+    # pl_states: frame index → PseudoLabeler state_dict (or None if fitting failed /
+    # not needed).  Populated in the pre-fitting pass below, consumed by both the
+    # Body (B2 foot anchoring) and Objects (O4 ground filtering) stages.
+    pl_states: Dict[int, Optional[dict]] = {}
 
     # ── SAM3 segmentation ─────────────────────────────────────────────────────
     print('\n[SAM3 segmentation]')
@@ -610,6 +661,75 @@ def run_pipeline(
         segmentor.unload()
     else:
         print(f'  All {len(frames)} frame(s) loaded from cache.')
+
+    _print_gpu(device)
+
+    # ── PseudoLabeler ground estimation (once per frame, shared by Body + Objects) ──
+    # Fits a small MLP gθ: R²→R on the aggregated LiDAR cloud for each frame.
+    # Runs before both Body and Objects stages so the result can be reused by:
+    #   B2 — foot anchoring: query pl_model(ped_xy) → z_ground, shift mesh feet
+    #   O4 — ground filtering: get_ground_bool() removes road-surface LiDAR before CFormer
+    # State_dicts are lightweight (~10 KB each) so all frames fit in RAM.
+    if _needs_pseudolabeler:
+        print('\n[PseudoLabeler ground estimation]')
+
+        # ── PseudoLabeler checkpoint ──────────────────────────────────────────
+        # If a cache file exists for this run and covers all frames, skip refitting.
+        # Delete <checkpoint_dir>/pl_states_cache.pt to force a refit.
+        _pl_cache_path = (Path(checkpoint_dir) / 'pl_states_cache.pt'
+                          if checkpoint_dir else None)
+        _pl_loaded = False
+        if _pl_cache_path is not None and _pl_cache_path.exists():
+            try:
+                _cached = torch.load(_pl_cache_path, map_location='cpu')
+                if isinstance(_cached, dict) and len(_cached) == len(frames):
+                    pl_states = _cached
+                    _pl_loaded = True
+                    print(f'  Loaded cached PseudoLabeler states for {len(frames)} frame(s) '
+                          f'from {_pl_cache_path}.')
+                else:
+                    print(f'  Cache size mismatch ({len(_cached)} vs {len(frames)} frames) '
+                          f'— refitting.')
+            except Exception as _e:
+                print(f'  Cache load failed ({_e}) — refitting.')
+
+        if not _pl_loaded:
+            # Fit only for frames not yet fully cached in both downstream stages.
+            _body_pending  = {i for i in range(len(frames))
+                              if _ckpt_path(checkpoint_dir, 'body', i) is None
+                              or not _ckpt_path(checkpoint_dir, 'body', i).exists()}
+            _obj_pending   = {i for i in range(len(frames))
+                              if _ckpt_path(checkpoint_dir, 'objects', i) is None
+                              or not _ckpt_path(checkpoint_dir, 'objects', i).exists()}
+            _pl_needed_for = ((_body_pending if _b2_enabled else set()) |
+                              (_obj_pending  if _pointmap_mode_pre == 'o4_ground_filter' else set()))
+
+            n_cached_pl = len(frames) - len(_pl_needed_for)
+            if n_cached_pl:
+                print(f'  Skipping {n_cached_pl} fully-cached frame(s).')
+
+            for i, frame in enumerate(frames):
+                if i not in _pl_needed_for or frame.lidar_path is None:
+                    pl_states[i] = None
+                    continue
+                pts_ego = _load_pts_ego(frame)
+                if pts_ego is None or len(pts_ego) == 0:
+                    pl_states[i] = None
+                    print(f'  [{frame.scene_name} frame {frame.frame_idx}] no LiDAR — skipping.')
+                    continue
+                pl_model = _fit_pseudolabeler(pts_ego, device, dev_root)
+                pl_states[i] = ({k: v.cpu() for k, v in pl_model.state_dict().items()}
+                                if pl_model is not None else None)
+
+            # Save cache so subsequent runs can skip refitting.
+            if _pl_cache_path is not None and pl_states:
+                try:
+                    torch.save(pl_states, _pl_cache_path)
+                    print(f'  Saved PseudoLabeler cache → {_pl_cache_path}')
+                except Exception as _e:
+                    print(f'  Warning: could not save PseudoLabeler cache: {_e}')
+    else:
+        pl_states = {i: None for i in range(len(frames))}
 
     _print_gpu(device)
 
@@ -665,7 +785,8 @@ def run_pipeline(
                         hdbscan_kwargs=hdbscan_params.get('pedestrian'),
                     )
                     if _b2_enabled:
-                        pl_model = _fit_pseudolabeler(pts_ego, device, dev_root)
+                        # Reconstruct PseudoLabeler from pre-fitted state_dict
+                        pl_model = _restore_pseudolabeler(pl_states.get(i), device, dev_root)
                         _apply_b2_ground_anchoring(
                             result, frame, pts_ego, pl_model, device,
                             # _stats=_gnd_stats,   # [DEBUG]
@@ -693,13 +814,15 @@ def run_pipeline(
     _print_gpu(device)
 
     # ── SAM3D Objects ─────────────────────────────────────────────────────────
-    _lidar_cfg    = getattr(cfg, 'sam3d_objects', None)
-    pointmap_mode = getattr(_lidar_cfg, 'pointmap_mode', 'baseline')
+    _lidar_cfg    = _lidar_cfg_pre   # already read above
+    pointmap_mode = _pointmap_mode_pre
     _mode_labels = {
         'baseline':        'MoGe baseline (non-metric)',
         'o1_lidar':        'O1 — sparse LiDAR pointmap',
         'o2_moge_affine':  'O2 — MoGe + global affine calibration',
         'o3_local_affine': 'O3 — MoGe + per-object local affine calibration',
+        'o4_ground_filter':  'O4 — CompletionFormer + global ground filter',
+        'o5_mask_hdbscan':   'O5 — CompletionFormer + per-mask HDBSCAN',
     }
     print(f'\n[SAM3D Objects — {_mode_labels.get(pointmap_mode, pointmap_mode)}]')
     obj_results = {}
@@ -719,6 +842,9 @@ def run_pipeline(
         n_cached = len(frames) - len(pending)
         if n_cached:
             print(f'  Resuming: {n_cached} frame(s) cached, {len(pending)} to process.')
+        cformer_ckpt  = getattr(_lidar_cfg, 'cformer_ckpt', None)
+        lidar_lines   = getattr(_lidar_cfg, 'lidar_lines', 32)
+        _ss_correction = bool(getattr(_lidar_cfg, 'ss_correction', False))  # THESIS: SS Correction flag
         obj_model = SAM3DObjectsModel(
             repo_path=str(obj_repo),
             config_path=str(obj_cfg_path),
@@ -726,6 +852,13 @@ def run_pipeline(
             device=device,
             pointmap_mode=pointmap_mode,
             hdbscan_params=hdbscan_params,
+            cformer_ckpt=cformer_ckpt,
+            lidar_lines=lidar_lines,
+            pl_ground_inlier_thres=_pl_ground_inlier,
+            ss_correction=_ss_correction,  # THESIS: SS Correction flag
+            proximity_min_pts=_proximity_min_pts,
+            proximity_ratio=_proximity_ratio,
+            hull_anchoring=_hull_anchoring,
         )
         obj_model.load()
         bar = tqdm(pending, total=len(frames), initial=len(frames) - len(pending),
@@ -733,8 +866,10 @@ def run_pipeline(
         for i, frame in bar:
             bar.set_postfix_str(f'{frame.scene_name}  frame {frame.frame_idx}')
             frame_sam3 = _get_sam3(i, sam3_mem, checkpoint_dir)
-            pts_ego = _load_pts_ego(frame) if frame.lidar_path is not None else None
-            result = obj_model.run_frame(frame, frame_sam3, pts_ego=pts_ego)
+            pts_ego  = _load_pts_ego(frame) if frame.lidar_path is not None else None
+            pl_model = (_restore_pseudolabeler(pl_states.get(i), device, dev_root)
+                        if pointmap_mode == 'o4_ground_filter' else None)
+            result = obj_model.run_frame(frame, frame_sam3, pts_ego=pts_ego, pl_model=pl_model)
             obj_results[i] = result
             p = _ckpt_path(checkpoint_dir, 'objects', i)
             if p:

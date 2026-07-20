@@ -117,6 +117,58 @@ A higher NDS means both high recall/precision and high quality of matched detect
 
 ---
 
+## ECP Ground Truth Coverage
+
+Ground truth 3D annotations exist for only **33 frames** across **3 scenes**, all from the Strasbourg latesession location (`v1.0-trainval`).
+
+| Scene | Total frames | Annotated frame indices |
+|---|---|---|
+| `scene-euro-citystrasbourg-scenariolatesession-00002_1` | 2,481 | 560, 600, 639, 679, 1040, 1080, 1120, 1160, 1200, 1240, 1280, 1320 |
+| `scene-euro-citystrasbourg-scenariolatesession-00003_1` | 641 | 239, 280, 320, 360, 400, 440, 480, 520, 560, 600, 640 |
+| `scene-euro-citystrasbourg-scenariolatesession-00007_1` | 3,601 | 2560, 2600, 2639, 2680, 2719, 2760, 2800, 2840, 2880, 2919 |
+
+Frames are spaced at roughly 40-frame intervals within each scene. All other scenes in the dataset have no GT annotations and cannot be evaluated.
+
+---
+
+## Run Naming Convention
+
+Evaluation results are stored under `eval_results/<dataset>/<run_name>/`.  The run name encodes the exact pipeline configuration used.
+
+### Structure
+
+```
+autolabeling[_lidar_integration_objects_<mode>_body_<mode>[_lidar_<N>_aggregated][_filtered]]
+```
+
+- **`autolabeling_baseline`** — no changes from the basic pipeline; no LiDAR integration for either Objects or Body.
+- Everything else starts with `autolabeling_lidar_integration` and then specifies the Objects mode, Body mode, and optional LiDAR settings.
+
+### Components
+
+| Component | Meaning |
+|---|---|
+| `objects_baseline` | SAM3D Objects in baseline mode (no LiDAR depth) |
+| `objects_o1` … `objects_o4` | SAM3D Objects with LiDAR mode O1–O4 (increasing depth integration complexity) |
+| `body_baseline` | SAM3D Body in baseline mode (no LiDAR depth) |
+| `body_b1` | SAM3D Body with LiDAR mode B1 |
+| `lidar_2_aggregated` | Temporal frame aggregation: 2 frames before + anchor + 2 frames after (5 sweeps total) |
+| `lidar_3_aggregated` | Temporal frame aggregation: 3 frames before + anchor + 3 frames after (7 sweeps total) |
+| `filtered` | Ego-vehicle filter and range filter applied to the point cloud |
+
+### Examples
+
+| Run name | Meaning |
+|---|---|
+| `autolabeling_baseline` | Full baseline — no LiDAR integration |
+| `autolabeling_lidar_integration_objects_baseline_body_b1` | Objects baseline, Body with B1 LiDAR |
+| `autolabeling_lidar_integration_objects_o1_body_baseline` | Objects O1, Body baseline |
+| `autolabeling_lidar_integration_objects_o3_body_b1` | Objects O3, Body B1, single-frame LiDAR |
+| `autolabeling_lidar_integration_objects_o3_body_b1_lidar_2_aggregated_filtered` | Objects O3, Body B1, 2-frame aggregation, filtered |
+| `autolabeling_lidar_integration_objects_o4_body_b1_lidar_2_aggregated_filtered` | Objects O4, Body B1, 2-frame aggregation, filtered |
+
+---
+
 ## Output Files
 
 After running evaluation, the output folder contains:

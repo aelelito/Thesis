@@ -135,9 +135,9 @@ python main_pseudo_vlm.py \
 # scene-euro-citystrasbourg-scenariolatesession-00007_1: frames 2550-2930
 python main_pseudo_vlm.py \
   --config configs/vlm/p_final_ecp.yaml \
-  --scenes scene-euro-citystrasbourg-scenariolatesession-00007_1 \
-  --frame-start 2550 \
-  --frame-end 2930 \
+  --scenes scene-euro-citystrasbourg-scenariolatesession-00002_1 \
+  --frame-start 550 \
+  --frame-end 1340 \
   --workers 1
 
 # to detach (before leaving SSH): ctrl+B -> D
@@ -185,15 +185,15 @@ conda run -n autolabeling python evaluation.py \
 # ecp (allows for multiple submission files to be evaluated at once, e.g. for different scenes, just add more paths to the --submission argument)
 conda run -n autolabeling python evaluation.py \
   --dataset ecp \
-  --submission /home/lleba/VESPA/outs/vlm/p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00002_1/#out_labels/vlm_p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00002_1_train_8class.json /home/lleba/VESPA/outs/vlm/p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00003_1/#out_labels/vlm_p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00003_1_train_8class.json /home/lleba/VESPA/outs/vlm/p_final_ecp/scene-euro-citystrasbourg-scenariolatesessionn-00007_1/#out_labels/vlm_p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00007_1_train_8class.json \
-  --out_dir eval_results/ecp/vespa_vlm_train/8class/ \
-  --plot_examples 10
+  --submission /home/lleba/VESPA/outs/vlm/p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00002_1/#out_labels/vlm_p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00002_1_train_3class.json /home/lleba/VESPA/outs/vlm/p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00003_1/#out_labels/vlm_p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00003_1_train_3class.json /home/lleba/VESPA/outs/vlm/p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00007_1/#out_labels/vlm_p_final_ecp/scene-euro-citystrasbourg-scenariolatesession-00007_1_train_3class.json \
+  --out_dir eval_results/ecp/vespa_vlm_train/3class/ \
+  --plot_examples 33
 
 # or for the autolabeling pipeline output
 conda run -n autolabeling python evaluation.py \
   --dataset ecp \
-  --submission /home/lleba/Thesis/Development/AutoLabeling/output/ecp/lidar_integration_option1/autolabel_ecp_annotated_8class.json \
-  --out_dir eval_results/ecp/autolabeling_lidar_integration_option1/8class/ \
+  --submission /media/lleba/ECP_Nuscenes_01/autolabeling/output/ecp/lidar_integration_objects_o4_body_b1_lidar_2_aggregated_filtered/autolabel_ecp_annotated_1class.json \
+  --out_dir eval_results/ecp/autolabeling_lidar_integration_objects_o4_body_b1_lidar_2_aggregated_filtered/1class/ \
   --plot_examples 33
 
 # to run the ground truth sanity check evaluation, use the following command (adapt paths accordingly)

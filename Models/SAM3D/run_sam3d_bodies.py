@@ -40,8 +40,8 @@ NUSCENES_SCENE_IDX = 10
 # Optional: restrict to a subset of frames for testing
 # Set to None to process all frames of a scene
 FRAME_START = 900  # e.g., 150
-FRAME_END   = 1500  # e.g., 155
-FRAME_SKIP  = 50    # Process every Nth frame (1 = all frames, 10 = every 10th frame)
+FRAME_END   = 910  # e.g., 155
+FRAME_SKIP  = 0    # Process every Nth frame (1 = all frames, 10 = every 10th frame)
 
 # Output directory
 OUTPUT_DIR = Path(f"/media/lleba/ECP_Nuscenes_01/SAM3D_Outputs/Strassbourg/scene_{NUSCENES_SCENE_IDX:03d}/SAM3D_Body")

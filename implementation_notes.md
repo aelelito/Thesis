@@ -133,8 +133,9 @@ ptmap[v, u] = (-X_cam, -Y_cam, Z_cam)
 
 ### Config flag
 ```yaml
-lidar:
+sam3d_objects:
   pointmap_mode: baseline   # 'baseline' | 'o1_lidar' | 'o2_moge_affine' | 'o3_local_affine'
+                            # | 'o4_ground_filter' | 'o5_mask_hdbscan'
 ```
 
 ---
@@ -436,52 +437,289 @@ See also edge case E5.
 
 ---
 
-### O4 — Dense Depth Completion  *(planned — CompletionFormer)*
+### O4 — Dense Depth Completion  *(implemented — CompletionFormer)*
 
-**Network choice**: CompletionFormer (Zhang et al., CVPR 2023).
+**Network choice**: CompletionFormer (Zhang et al., CVPR 2023).  
+**Checkpoint**: KITTIDC_L1L2.pt (~334 MB), pretrained on KITTI Depth Completion.
 
-Full reasoning for the network choice (CompletionFormer vs. MapAnything vs. BP-Net vs. OGNI-DC), the global-per-camera vs. per-mask workflow decision, the parallax filtering strategy (AutoBox 1.5×median rule as primary, HDBSCAN as fallback), fallback chain, and expected wins/losses vs. O3 are documented in `lidar_integration_plan.md` § O4. Summarise here once the implementation stabilises.
+Full reasoning for the network choice (CompletionFormer vs. MapAnything vs. BP-Net vs. OGNI-DC), the global-per-camera vs. per-mask workflow decision, the parallax filtering strategy, fallback chain, and expected wins/losses vs. O3 are documented in `lidar_integration_plan.md` § O4.
 
 Directly addresses the O3 limitation for large close side-on vehicles (§ 3.O3 known limitation and § 5.E5): a depth completion network trained on real LiDAR+image pairs produces accurate per-pixel metric depth across the visible side surface where MoGe's relative gradient is inaccurate.
 
-*Implementation details, config values, and code paths to be added when implemented.*
+**Implementation**:
+- `Models/CompletionFormer/` — network source (patched for PyTorch 2.x: `pvt.py` stubs removed `mmseg`/`mmcv` imports and skips missing pretrained backbone files; DCNv2 CUDA kernel patched for removed THC headers)
+- `Testing/depth_completion.ipynb` — standalone prototype: sparse LiDAR → CompletionFormer → dense depth → PyTorch3D pointmap, with Plotly 3D visualisation
+- `Testing/autolabeling_pipeline.ipynb` — integrated as `POINTMAP_MODE = 'o4_ground_filter'`
+- `AutoLabeling/src/autolabeling/models/sam3d_objects.py` — `_load_cformer()`, `_compute_dense_completion_pointmap()`, branch in `run_frame()`
+- `AutoLabeling/configs/{nuscenes,ecp}.yaml` — `pointmap_mode: o4_ground_filter`, `cformer_ckpt`, `lidar_lines`
+
+**Key config values**:
+```
+data_name      = 'KITTIDC'
+prop_time      = 6
+affinity       = 'TGASS'
+affinity_gamma = 0.5
+conf_prop      = True
+preserve_input = True    ← hard-anchors LiDAR pixels in the output (MAE → ~0 at anchors)
+lidar_lines    = 32      (nuScenes) / 64 (ECP)
+```
+
+**Workflow per camera**:
+1. Pre-filtered aggregated LiDAR (`pts_ego`) passed through PseudoLabeler ground filter (step below)
+2. Filtered cloud projected into camera → sparse `(H,W)` depth map using `np.minimum.at` on `np.full(..., np.inf)` (min-depth per pixel, foreground wins)
+3. CompletionFormer: `{'rgb': (1,3,H,W), 'dep': (1,1,H,W)} → {'pred': (1,1,H,W)}`
+4. Back-project dense depth → `(H,W,3)` PyTorch3D pointmap `(-X_cam, -Y_cam, Z_cam)`
+5. Same fixed pointmap passed to all SAM3D Objects calls for that camera — no HDBSCAN, no MoGe
+
+**Fallback**: if no LiDAR is available for a frame, falls back to MoGe baseline.
 
 ---
 
-### O5 — Low-Level SAM3D Objects LiDAR Integration  *(candidate, not yet planned)*
+#### O4 Ground Filter — PseudoLabeler
 
-Rather than pre-processing the pointmap, modify SAM3D Objects' source code to incorporate
-LiDAR geometry directly inside the model during inference.
+Ground-plane LiDAR returns (road surface between ego and a distant object) project into the
+lower pixels of foreground object masks.  With `preserve_input=True`, CompletionFormer
+hard-anchors its output at those pixels to road depth — so the completed map shows the road
+surface *inside* the object's image region, causing the object to appear incorrectly close
+and the resulting OBB to be misplaced.
 
-**Motivation**: O1–O3 all feed LiDAR through the `PointPatchEmbed` hook — i.e. by
-replacing or calibrating the pointmap that conditions the model.  The model still has to
-*decide* what 3-D structure to generate; LiDAR only adjusts its depth prior.  For a large
-vehicle viewed side-on with dense LiDAR on its surface, the LiDAR already encodes most of
-the object's extent and position directly — the model's diffusion process adds relatively
-little compared to simply reading those measurements.
+**Fix**: remove ground-classified returns from `pts_ego` before building the sparse depth
+map.  The **PseudoLabeler** (see Stage 2 above) predicts ground height `z_ground(x,y)` at
+every LiDAR point location.  `get_ground_bool(pc, inlier_thres=0.10)` classifies a point as
+ground if `z_point − z_ground ≤ inlier_thres`.
 
-**Candidate approaches** (descending invasiveness):
-1. **Pointmap refinement with LiDAR surface constraints** — after O3 affine, project the
-   dominant HDBSCAN cluster back to camera space and enforce that the mesh vertices that
-   correspond to those LiDAR pixels lie at the measured depth.  Post-inference, non-ML.
-2. **LiDAR conditioning inside PointPatchEmbed** — modify the embed layer to concatenate
-   a confidence/validity mask alongside XYZ, teaching the model to trust LiDAR tokens more
-   than MoGe-derived ones.  Requires re-training or fine-tuning.
-3. **Explicit shape anchor from LiDAR footprint** — for objects with a complete 3-D LiDAR
-   surface (dense close vehicle), skip the diffusion generator's shape output and fit OBB
-   directly to the LiDAR surface cluster.  Most aggressive; bypasses the model for those
-   objects entirely.
+**Why 0.10 m (not the model default 0.40 m)**: The model's default 0.40 m threshold is
+tuned for semantic segmentation and removes points up to 40 cm above the predicted surface —
+this would remove bicycle frame returns at ~0.20 m and bumper returns at ~0.30 m.  0.10 m
+targets road-surface returns only, keeping all object surfaces.
 
-The third approach is the most practically relevant for the "dense side-surface" failure
-mode: when the dominant HDBSCAN cluster covers the object well, the LiDAR cluster itself
-is a more reliable shape source than the diffusion-generated mesh.
+**Why not strict `z > z_ground` (threshold 0.0)**:  PseudoLabeler is trained with an
+asymmetric lower-envelope loss (`z_predicted ≤ actual z_ground`), so all true ground points
+have positive clearance `z − z_ground > 0`.  A strict threshold of 0 removes nothing.
+`inlier_thres = 0.10` captures the true ground surface by accepting the small positive bias.
 
-**Trade-off vs. O4**: O4 (depth completion) fixes the pointmap quality upstream so the
-existing model benefits; O5 changes how the model uses any pointmap.  O4 is lower-risk
-and more likely to help across all object types.  O5 is higher-risk but potentially higher-
-reward for cases where the model's shape generation is the bottleneck, not the depth map.
+**PseudoLabeler pre-fitting** (shared between O4 and B1 Stage 2):
+- A single pre-fitting pass runs over all frames **before** the Body and Objects pipeline
+  stages.  Each frame's fitted model state_dict (~10 KB) is stored in `pl_states: Dict[int,
+  Optional[dict]]` in RAM.
+- O4 and B1 Stage 2 both call `_restore_pseudolabeler(pl_states[i], device, dev_root)` to
+  reconstruct the model — no redundant fitting per stage.
+- Only frames where at least one Body or Objects result is still pending trigger a fit; frames
+  with existing checkpoints skip fitting (`pl_states[i] = None`).
+- **O5 does NOT need PseudoLabeler** — when `pointmap_mode == 'o5_mask_hdbscan'` the ground
+  filter step is skipped entirely; the pre-fitting loop only runs if O4 or B1 is active.
 
-*To be documented when implemented.*
+**PseudoLabeler training** (`_fit_pseudolabeler()` in `pipeline.py`):
+- Optimiser: AdamW, lr=1e-2, weight_decay=1e-4
+- Scheduler: CosineAnnealingLR, T_max=2500, eta_min=1e-4
+- Max steps: 2500
+- Early stopping: patience=300 steps, **with warmup window of 200 steps**
+  - Both best-loss tracking AND patience counting are deferred until after the warmup.
+    During steps 0–199 the optimizer runs freely without updating `_best_loss`.
+  - **Why defer tracking (not just patience)**: random init produces `pred ≈ 0`; for flat
+    terrain (nuScenes Boston/Singapore) the ground is also near `z ≈ 0`, so `loss_0` is
+    accidentally low.  If `_best_loss` is set at step 0, the step-1 overshoot (lr=1e-2)
+    raises loss and the recovered model may never beat the random-init baseline.  Patience
+    then fires at exactly `warmup + patience = 500` steps on every frame.
+  - With tracking deferred to step 200, `_best_loss` is set from the actual trained state
+    after the overshoot/recovery phase.  Typical step counts: 500–2500 for varied terrain
+    (ECP Strasbourg), converging faster for flat terrain (nuScenes Boston/Singapore).
+
+**Config**: `sam3d_objects.pl_ground_inlier_thres: 0.10  # m`
+
+**Code**:
+- Pre-fitting: `_fit_pseudolabeler()` / `_restore_pseudolabeler()` and the `pl_states` dict in `AutoLabeling/src/autolabeling/pipeline.py`
+- O4 integration: `SAM3DObjectsModel._filter_above_ground()` called from `run_frame()` in `AutoLabeling/src/autolabeling/models/sam3d_objects.py`
+- Notebook: `Testing/autolabeling_pipeline.ipynb` — cell `pseudolabeler_ground` (O4 only, guarded by `POINTMAP_MODE == 'o4_ground_filter'`)
+
+**`preserve_input=True` rationale**: CompletionFormer's default behaviour uses LiDAR as soft guidance. Setting `preserve_input=True` hard-anchors the output at LiDAR pixel locations (overrides network prediction with the measured depth there), making MAE at LiDAR pixels ≈ 0. The network still interpolates freely between anchors. This is the correct choice for metric accuracy — LiDAR provides ground-truth depth at those pixels and the network should not deviate from it.
+
+---
+
+### O5 — CompletionFormer + Per-Mask HDBSCAN Anchor Cleaning  *(implemented)*
+
+**`pointmap_mode: o5_mask_hdbscan`**
+
+Like O4, uses CompletionFormer to produce a dense metric depth map fed as the SAM3D Objects
+pointmap.  Unlike O4, O5 **skips the PseudoLabeler ground filter** and instead cleans the
+sparse LiDAR anchor map using per-mask HDBSCAN before passing it to CompletionFormer.
+
+**Motivation**: O4's ground filter is the most expensive and brittle step — it requires
+fitting the PseudoLabeler MLP per frame, which adds latency and can fail if the LiDAR sweep
+is sparse.  The actual harm from ground returns is that they project inside foreground masks
+and anchor CompletionFormer to the wrong (road) depth.  HDBSCAN already isolates in-mask
+surface clusters for O3's affine fit — the same logic can be applied here to simply remove
+non-surface points from the LiDAR anchor map before completing the depth map.  Points
+outside all object masks are kept as-is (ground returns outside masks do not corrupt
+foreground object depths).
+
+**Workflow per camera**:
+1. Pre-filtered aggregated LiDAR → projected into camera frame → `u_vis, v_vis, Z_vis, pts_ego_vis`.
+2. For each detected object mask (only `pipeline_type == 'objects'` masks):
+   a. Find in-mask LiDAR indices.
+   b. Run HDBSCAN on `pts_ego_vis[in_mask]` using per-class params (same as O3/Step 0).
+   c. Label the dominant cluster (most points); mark all other in-mask points as noise.
+   d. Set `keep[noise_idx] = False`.
+3. Build cleaned sparse depth map from `u_vis[keep], v_vis[keep], Z_vis[keep]`
+   and **all out-of-mask points** (unaffected).
+4. CompletionFormer: cleaned sparse map + RGB → dense metric depth → PyTorch3D pointmap.
+5. Same fixed pointmap passed to all SAM3D Objects calls for that camera.
+
+**Key difference from O4**: No PseudoLabeler needed; ground returns inside masks are
+removed by HDBSCAN isolation rather than predicted ground-height thresholding.
+
+**Key difference from O3**: O3 uses HDBSCAN per-object to extract a local affine scale for
+MoGe.  O5 uses HDBSCAN to clean the LiDAR anchor before CompletionFormer — it does not
+use MoGe at all.
+
+**Observed performance vs. O3 (nuScenes mini, 8-class)**:
+- mAP nearly identical (~flat): detection recall and centre localisation are both anchored
+  by the same HDBSCAN-cleaned LiDAR depth, so neither metric changes substantially.
+- TP errors improve — notably motorcycle AOE (0.319 → 0.092) and bicycle/car ASE.
+  CompletionFormer produces a shape-complete depth map that the diffusion model uses to
+  recover better extent and orientation, even when the LiDAR surface is sparse.
+
+**Fallback**: if no LiDAR is available for a frame, falls back to MoGe baseline (same as O4).
+
+**Config**:
+```yaml
+sam3d_objects:
+  pointmap_mode: o5_mask_hdbscan
+  cformer_ckpt: /path/to/KITTIDC_L1L2.pt   # same checkpoint as O4
+  lidar_lines: 64    # ECP: 64 | nuScenes: 32
+  hdbscan:           # same per-class params as O3 (Step 0)
+    pedestrian: {min_cluster_size: 3, min_samples: 1, cluster_eps: 0.20}
+    # … one block per class
+```
+
+**Implementation**:
+- `SAM3DObjectsModel._build_o5_sparse_points()` in `AutoLabeling/src/autolabeling/models/sam3d_objects.py`
+- Branch `elif self.pointmap_mode == 'o5_mask_hdbscan':` in `run_frame()`
+- Notebook: `Testing/autolabeling_pipeline.ipynb` — `build_o5_sparse_points()` function, `POINTMAP_MODE = 'o5_mask_hdbscan'`
+- `pipeline.py`: `_needs_pseudolabeler` check excludes O5; `_mode_labels` includes O5 label
+
+---
+
+### SS Correction — Mid-Pipeline Voxel Suppression  *(implemented, flag-guarded)*
+
+**Not an alternative to O1–O5** — SS Correction is an **orthogonal dimension** that can be
+layered on top of any O4 or O5 run.  It is activated by a separate config flag:
+
+```yaml
+sam3d_objects:
+  ss_correction: false   # true = enable; false = strict no-op (identical to unmodified code)
+```
+
+**Motivation**
+
+O5 (and O4) produce far more false positives than O3 on nuScenes.  The root cause: objects
+with zero in-mask LiDAR returns (hidden, far-away, or between scan lines) receive plausible
+metric depths from CompletionFormer (it interpolates based on surrounding returns and image
+features).  SAM3D Objects then predicts a confident 3D box — but the object was never there,
+it was background or an object outside the evaluation range.  O3 accidentally suppresses
+these by leaving the depth at garbage MoGe-relative units, outside metric evaluation range.
+
+SS Correction targets this by suppressing **voxels that are placed behind the visible surface**
+according to the LiDAR-anchored CFormer depth map.  It intercepts SAM3D Objects mid-pipeline:
+after the sparse-structure (SS) diffusion generates a voxel grid (`coords`) but before the
+latent `SLAT` is decoded into a mesh.  Voxels at `Z > Z_surface + 0.3 m` (the median depth
+of in-mask LiDAR-anchored pixels) are dropped from `coords`.
+
+**Confidence mask design**
+
+LiDAR-anchored pixels (where `preserve_input=True` hard-anchors CFormer) are given full
+suppression trust — if a voxel projects behind this depth, it is behind the real surface.
+CFormer-interpolated pixels (no LiDAR anchor) receive no suppression trust (asymmetric).
+Only the LiDAR-anchored pixels form the `anchor_mask`.
+
+**Voxel projection math**
+
+```
+vox_norm = coords[:, 1:] / 64.0 - 0.5          # [0,63]^3 → [-0.5, 0.5]^3
+vox_p3d  = scale * (vox_norm @ R.T) + trans     # object-local → P3D camera space
+vox_Z    = vox_p3d[:, 2]                        # camera-space depth
+suppress_mask = vox_Z > Z_surface + 0.3         # metres behind surface
+coords = coords[~suppress_mask]
+```
+
+where `R, trans, scale` are from `ss_return_dict` (SAM3D Objects output dict from Stage 1
+diffusion).  `coords` is shape `(N, 4)` — `[batch_idx, z, y, x]` in voxel indices `[0, 63]`.
+
+---
+
+#### Touched files and line numbers
+
+All changes are wrapped in `# ── THESIS MODIFICATION: SS LiDAR Correction` /
+`# ── END THESIS MODIFICATION` comment blocks (or `# THESIS:` inline comments), making them
+easy to identify and revert.  Setting `ss_correction: false` in the config guarantees a
+**strict no-op** — every code path is guarded by either `if ss_correction_fn is not None:`
+or `if self.ss_correction:`.
+
+---
+
+**`AutoLabeling/configs/nuscenes.yaml`** and **`AutoLabeling/configs/ecp.yaml`**
+- Added `ss_correction: false` under `sam3d_objects:` (disables SS Correction by default).
+
+---
+
+**`AutoLabeling/src/autolabeling/models/sam3d_objects.py`**
+
+| Line | Change |
+|------|--------|
+| L54 | `ss_correction: bool = False` added to `__init__` signature |
+| L66 | `self.ss_correction = ss_correction` stored |
+| L538–L642 | `_build_ss_correction_fn(self, dense_depth, anchor_mask, K, binary_mask)` method added (THESIS MODIFICATION block) |
+| L675–L676 | `_dense_depth_ss = None; _anchor_mask_ss = None` initialised (O4 branch) |
+| L687–L693 | Build `_anchor_mask_ss` from HDBSCAN-cleaned LiDAR pixels when `ss_correction=True` (O4 branch) |
+| L699–L700 | Same initialisers (O5 branch) |
+| L711–L716 | Same anchor mask build (O5 branch) |
+| L722–L723 | `_dense_depth_ss = None; _anchor_mask_ss = None` for O3/baseline branches (no SS Correction available) |
+| L761–L767 | Build `_ss_fn` per-mask and pass `ss_correction_fn=_ss_fn` to inference call |
+
+---
+
+**`AutoLabeling/src/autolabeling/pipeline.py`**
+
+| Line | Change |
+|------|--------|
+| L844 | `_ss_correction = bool(getattr(_lidar_cfg, 'ss_correction', False))` — read config flag |
+| L855 | `ss_correction=_ss_correction` passed to `SAM3DObjectsModel(...)` |
+
+---
+
+**`Models/SAM3D/sam-3d-objects/sam3d_objects/pipeline/inference_pipeline_pointmap.py`**
+
+*(SAM3D Objects source — modified in-place)*
+
+| Change | Location |
+|--------|----------|
+| `ss_correction_fn=None` parameter added to `run()` | THESIS MODIFICATION block in `run()` signature |
+| Intercept block after `coords = ss_return_dict["coords"]` that calls `ss_correction_fn(coords, ss_return_dict)` and updates `coords` | THESIS MODIFICATION block after SS generation, before SLAT decode |
+
+---
+
+**`Models/SAM3D/sam-3d-objects/notebook/inference.py`**
+
+*(SAM3D Objects notebook API — modified in-place)*
+
+| Change | Location |
+|--------|----------|
+| `ss_correction_fn=None` added to `Inference.__call__()` | THESIS MODIFICATION block in `__call__` signature (L110–L113) |
+| `ss_correction_fn=ss_correction_fn` forwarded to `self._pipeline.run(...)` | L127 |
+
+---
+
+**`Testing/autolabeling_pipeline.ipynb`** — cell 20 (`run_sam3d_objects` + dispatch)
+
+| Cell-20 line | Change |
+|-------------|--------|
+| L159–L218 | `build_ss_correction_fn(dense_depth, anchor_mask, binary_mask)` helper added (THESIS MODIFICATION block) |
+| L221 | `ss_data=None` added to `run_sam3d_objects` signature |
+| L260–L268 | Per-mask `_ss_fn = build_ss_correction_fn(...)` built and passed as `ss_correction_fn=_ss_fn` to `inference_model(...)` |
+| L501–L512 | O4 dispatch: `_ss_data_o4` built from `_anch_o4` when `SS_CORRECTION=True`, passed as `ss_data=_ss_data_o4` |
+| L529–L540 | O5 dispatch: same pattern → `_ss_data_o5` / `ss_data=_ss_data_o5` |
+
+Config cell (cell 4) previously added: `SS_CORRECTION = False`
 
 ---
 
@@ -722,10 +960,11 @@ single depth (e.g. a car at 20 m head-on) tend to produce better OBBs than objec
 for near-uniform-depth regions.
 
 **Potential fixes**:
-- O4 (depth completion) — replaces MoGe with a network trained on real LiDAR+RGB data
-  that produces accurate per-pixel metric depth for close large objects.
-- O5 candidate 3 — when the dominant HDBSCAN cluster covers the object well, fit the OBB
-  directly to the LiDAR cluster instead of the diffusion-generated mesh.
+- O4 (`o4_ground_filter`) — replaces MoGe with CompletionFormer (LiDAR+RGB trained) depth
+  map, with PseudoLabeler ground filtering before building the sparse anchor.
+- O5 (`o5_mask_hdbscan`) — same CompletionFormer backend but uses per-mask HDBSCAN to
+  clean ground returns from the sparse anchor; no PseudoLabeler needed.  Implemented and
+  evaluated — TP errors (AOE, ASE) improve over O3; mAP is comparable.
 
 ---
 

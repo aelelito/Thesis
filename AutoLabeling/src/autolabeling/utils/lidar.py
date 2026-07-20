@@ -80,14 +80,23 @@ def filter_inmask_lidar_hdbscan(
     min_cluster_size=3,
     min_samples=1,
     cluster_eps=0.4,
+    proximity_min_pts=30,
+    proximity_ratio=0.70,
 ):
     """
     Isolate the dominant LiDAR surface cluster from in-mask points using HDBSCAN.
 
     Clustering is performed in 3D ego-frame coordinates (metres) so the distance
-    metric is physically meaningful and range-invariant.  The largest cluster is
-    returned as the object surface estimate; smaller clusters and noise (label -1)
-    are discarded.
+    metric is physically meaningful and range-invariant.
+
+    Cluster selection:
+    - Normally the largest cluster is returned (object surface estimate).
+    - Proximity selection: when the two largest clusters both have ≥ proximity_min_pts
+      points and the second is ≥ proximity_ratio × largest, pick the CLOSER one by
+      ego-frame centroid distance.  This prevents a large background cluster from
+      dominating when an occluder and an object each contribute roughly equal points.
+
+    Smaller clusters and noise (label -1) are always discarded.
 
     Parameters
     ----------
@@ -96,6 +105,10 @@ def filter_inmask_lidar_hdbscan(
     min_samples      : int             HDBSCAN min_samples
     cluster_eps      : float           HDBSCAN cluster_selection_epsilon [m]
                                        merges sub-clusters closer than this distance
+    proximity_min_pts : int            min size of largest cluster to trigger
+                                       proximity selection (default 30)
+    proximity_ratio   : float          second/largest size ratio threshold for
+                                       proximity selection (default 0.70)
 
     Returns
     -------
@@ -123,7 +136,18 @@ def filter_inmask_lidar_hdbscan(
     if len(unique) == 0:
         return None
 
-    dominant = unique[np.argmax(counts)]
+    order    = np.argsort(counts)[::-1]
+    biggest  = int(counts[order[0]])
+    if (biggest >= proximity_min_pts
+            and len(order) >= 2
+            and counts[order[1]] >= proximity_ratio * biggest):
+        c0, c1 = unique[order[0]], unique[order[1]]
+        d0 = float(np.linalg.norm(pts_ego_inmask[labels == c0].mean(axis=0)))
+        d1 = float(np.linalg.norm(pts_ego_inmask[labels == c1].mean(axis=0)))
+        dominant = c0 if d0 <= d1 else c1
+    else:
+        dominant = unique[order[0]]
+
     return labels == dominant
 
 
@@ -178,18 +202,36 @@ def _walk_lidar_tokens(nusc, anchor_token: str, n_before: int, n_after: int) -> 
     return tokens
 
 
-def _load_sweep_ego(nusc, tok: str, R_e2g_anchor: np.ndarray, t_e2g_anchor: np.ndarray) -> np.ndarray:
+def _load_sweep_ego(
+    nusc, tok: str, R_e2g_anchor: np.ndarray, t_e2g_anchor: np.ndarray,
+    use_ego_body_filter: bool = True,
+    ego_box_half_x: float = 4.0,
+    ego_box_half_y: float = 1.5,
+    ego_box_z_min: float = 0.5,
+    ego_box_z_max: float = 2.5,
+) -> np.ndarray:
     """
     Load one LiDAR sweep and transform it into the anchor ego frame.
 
-    Chain: LiDAR sensor → sweep ego → global → anchor ego.
+    Chain: LiDAR sensor → sweep ego → (ego-body filter) → global → anchor ego.
+
+    The ego-body filter is applied in the sweep's own ego frame (vehicle always
+    at the origin) before the global transform.  This ensures ego-body returns
+    are removed regardless of the temporal offset between this sweep and the
+    anchor, avoiding the displacement artefact that occurs when filtering in
+    anchor ego frame after sweeps from different timestamps are already merged.
 
     Parameters
     ----------
-    nusc          : NuScenes instance
-    tok           : sample_data token for this sweep
-    R_e2g_anchor  : (3, 3) rotation  ego → global at anchor timestamp
-    t_e2g_anchor  : (3,)   translation ego → global at anchor timestamp
+    nusc               : NuScenes instance
+    tok                : sample_data token for this sweep
+    R_e2g_anchor       : (3,3) rotation  ego → global at anchor timestamp
+    t_e2g_anchor       : (3,)  translation ego → global at anchor timestamp
+    use_ego_body_filter: bool  apply ego-body exclusion box in sweep ego frame
+    ego_box_half_x     : float half-length fore/aft  [m]
+    ego_box_half_y     : float half-width left/right [m]
+    ego_box_z_min      : float lower Z cutoff of ego box [m]
+    ego_box_z_max      : float upper Z cutoff of ego box [m]
 
     Returns
     -------
@@ -207,20 +249,38 @@ def _load_sweep_ego(nusc, tok: str, R_e2g_anchor: np.ndarray, t_e2g_anchor: np.n
     R_e2g_sw = _Quaternion(ego_pose['rotation']).rotation_matrix.astype(np.float64)
     t_e2g_sw = np.array(ego_pose['translation'], dtype=np.float64)
 
-    pts_raw     = np.fromfile(lid_path, dtype=np.float32).reshape(-1, 5)[:, :3].astype(np.float64)
-    pts_ego_sw  = (R_l2e @ pts_raw.T).T + t_l2e
+    pts_raw    = np.fromfile(lid_path, dtype=np.float32).reshape(-1, 5)[:, :3].astype(np.float64)
+    pts_ego_sw = (R_l2e @ pts_raw.T).T + t_l2e
+
+    if use_ego_body_filter:
+        _in_box    = (
+            (np.abs(pts_ego_sw[:, 0]) < ego_box_half_x) &
+            (np.abs(pts_ego_sw[:, 1]) < ego_box_half_y) &
+            (pts_ego_sw[:, 2] > ego_box_z_min) &
+            (pts_ego_sw[:, 2] < ego_box_z_max)
+        )
+        pts_ego_sw = pts_ego_sw[~_in_box]
+
     pts_global  = (R_e2g_sw @ pts_ego_sw.T).T + t_e2g_sw
     pts_ego_anc = (R_e2g_anchor.T @ (pts_global - t_e2g_anchor).T).T
     return pts_ego_anc
 
 
-def load_lidar_pts_aggregated(nusc, frame, n_before: int, n_after: int) -> Optional[np.ndarray]:
+def load_lidar_pts_aggregated(
+    nusc, frame, n_before: int, n_after: int,
+    use_ego_body_filter: bool = True,
+    ego_box_half_x: float = 4.0,
+    ego_box_half_y: float = 1.5,
+    ego_box_z_min: float = 0.5,
+    ego_box_z_max: float = 2.5,
+) -> Optional[np.ndarray]:
     """
     Load and aggregate multiple LiDAR sweeps around the anchor frame.
 
     All sweeps are ego-motion compensated to the anchor ego frame before
-    concatenation, so the resulting point cloud is as if all points were
-    captured at the anchor timestamp.
+    concatenation.  The ego-body filter is applied per-sweep in each sweep's
+    own ego frame so that returns from the ego vehicle are always removed at
+    the origin regardless of sweep timing.
 
     Falls back to a single-sweep load when:
       - frame has no lidar_sd_token (dataset without LIDAR_TOP)
@@ -228,10 +288,13 @@ def load_lidar_pts_aggregated(nusc, frame, n_before: int, n_after: int) -> Optio
 
     Parameters
     ----------
-    nusc     : NuScenes instance
-    frame    : FrameRecord with lidar_sd_token, R_e2g, t_e2g populated
-    n_before : number of sweeps before anchor to include
-    n_after  : number of sweeps after anchor to include
+    nusc               : NuScenes instance
+    frame              : FrameRecord with lidar_sd_token, R_e2g, t_e2g populated
+    n_before           : number of sweeps before anchor to include
+    n_after            : number of sweeps after anchor to include
+    use_ego_body_filter: bool  passed through to _load_sweep_ego
+    ego_box_half_x/y   : float ego-body box half-extents [m]
+    ego_box_z_min/max  : float ego-body box Z band [m]
 
     Returns
     -------
@@ -244,8 +307,18 @@ def load_lidar_pts_aggregated(nusc, frame, n_before: int, n_after: int) -> Optio
     if n_before == 0 and n_after == 0:
         return load_lidar_pts(frame)   # no aggregation requested
 
+    _filter_kw = dict(
+        use_ego_body_filter=use_ego_body_filter,
+        ego_box_half_x=ego_box_half_x,
+        ego_box_half_y=ego_box_half_y,
+        ego_box_z_min=ego_box_z_min,
+        ego_box_z_max=ego_box_z_max,
+    )
     sweep_tokens = _walk_lidar_tokens(nusc, frame.lidar_sd_token, n_before, n_after)
-    all_pts = [_load_sweep_ego(nusc, tok, frame.R_e2g, frame.t_e2g) for _, tok in sweep_tokens]
+    all_pts = [
+        _load_sweep_ego(nusc, tok, frame.R_e2g, frame.t_e2g, **_filter_kw)
+        for _, tok in sweep_tokens
+    ]
     return np.concatenate(all_pts, axis=0)
 
 
