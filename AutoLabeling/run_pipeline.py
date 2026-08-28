@@ -38,10 +38,10 @@ def _dict_to_ns(d):
     return d
 
 
-def load_config(path: str) -> SimpleNamespace:
+def load_config(path: str):
     with open(path) as f:
         raw = yaml.safe_load(f)
-    return _dict_to_ns(raw)
+    return _dict_to_ns(raw), raw
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    cfg  = load_config(args.config)
+    cfg, cfg_raw = load_config(args.config)
 
     output_dir   = Path(args.output_dir or cfg.output_dir)
     split        = args.split or cfg.split  # CLI overrides config; always 'train' or 'val'
@@ -126,12 +126,25 @@ def main():
     print(f'Loading {cfg.dataset.upper()} dataset from {cfg.data_root} ({cfg.version})...')
     nusc = NuScenes(version=cfg.version, dataroot=cfg.data_root, verbose=False)
 
+    # ── Determine single-camera vs. multi-camera mode ─────────────────────────
+    # Must be computed before dataset-specific branching so the annotated-only
+    # ECP path can also route to multi-camera frame collection.
+    _cameras_list = getattr(cfg, 'cameras', None)   # plural field in config
+    _multi_cam    = bool(_cameras_list and len(_cameras_list) > 1)
+
     if cfg.dataset == 'ecp':
         from src.autolabeling.data.ecp_loader import (
-            collect_frames, collect_annotated_frames, get_annotated_scene_names,
+            collect_frames, collect_annotated_frames,
+            collect_annotated_frames_multi_cam, collect_frames_multi_cam,
+            get_annotated_scene_names,
         )
         if args.annotated_only:
-            frames = collect_annotated_frames(nusc, cfg.camera)
+            if _multi_cam:
+                frames_per_cam = collect_annotated_frames_multi_cam(nusc, _cameras_list)
+                frames = frames_per_cam[_cameras_list[0]]
+            else:
+                _camera = _cameras_list[0] if _cameras_list else cfg.camera
+                frames = collect_annotated_frames(nusc, _camera)
         else:
             if args.scenes is None:
                 print('ECP: restricting to annotated scenes only.')
@@ -139,7 +152,9 @@ def main():
             else:
                 scene_names = args.scenes
     else:
-        from src.autolabeling.data.nuscenes_loader import collect_frames
+        from src.autolabeling.data.nuscenes_loader import (
+            collect_frames, collect_frames_multi_cam,
+        )
         if args.scenes is None:
             from nuscenes.utils.splits import create_splits_scenes
             all_splits  = create_splits_scenes()
@@ -152,34 +167,62 @@ def main():
 
     if not (cfg.dataset == 'ecp' and args.annotated_only):
         print(f'Collecting frames (frame_start={args.frame_start}, frame_end={args.frame_end})...')
-        frames = collect_frames(
-            nusc, scene_names, cfg.camera, args.frame_start, args.frame_end
-        )
-    print(f'Total: {len(frames)} keyframe(s) across '
-          f'{len(set(f.scene_name for f in frames))} scene(s).\n')
+        if _multi_cam:
+            frames_per_cam = collect_frames_multi_cam(
+                nusc, scene_names, _cameras_list, args.frame_start, args.frame_end
+            )
+            frames = frames_per_cam[_cameras_list[0]]  # reference list for count / names
+        else:
+            _camera = (_cameras_list[0] if _cameras_list else cfg.camera)
+            frames = collect_frames(nusc, scene_names, _camera, args.frame_start, args.frame_end)
+
+    _n_scenes = len(set(f.scene_name for f in frames))
+    if _multi_cam:
+        _n_cams = len(_cameras_list)
+        print(f'Total: {len(frames)} keyframe(s) × {_n_cams} cameras = '
+              f'{len(frames) * _n_cams} frame–camera pairs '
+              f'across {_n_scenes} scene(s).\n')
+    else:
+        print(f'Total: {len(frames)} keyframe(s) across {_n_scenes} scene(s).\n')
 
     if not frames:
         print('No frames to process. Exiting.')
         sys.exit(0)
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
-    from src.autolabeling.pipeline import run_pipeline
-    body_results, obj_results = run_pipeline(cfg, frames, checkpoint_dir=checkpoint_dir, nusc=nusc)
-
-    # ── Write submission ───────────────────────────────────────────────────────
-    # Always build 8class first, then derive 3class and 1class by remapping
-    # detection_name values using configs/class_mapping/<mapping>.yaml.
     from src.autolabeling.writers.submission import (
         build_submission, remap_submission, write_submission,
     )
 
-    submission_8class = build_submission(
-        frames=frames,
-        body_results=body_results,
-        obj_results=obj_results,
-        split=split,
-        mapping_name='8class',
-    )
+    if _multi_cam:
+        from src.autolabeling.pipeline import run_multi_camera_pipeline
+        from src.autolabeling.writers.submission import build_submission_multi_cam
+        body_results_all, obj_results_all = run_multi_camera_pipeline(
+            cfg, frames_per_cam, checkpoint_dir=checkpoint_dir, nusc=nusc,
+        )
+        submission_8class = build_submission_multi_cam(
+            frames_per_cam=frames_per_cam,
+            body_results_all=body_results_all,
+            obj_results_all=obj_results_all,
+            split=split,
+            mapping_name='8class',
+            config=cfg_raw,
+        )
+    else:
+        from src.autolabeling.pipeline import run_pipeline
+        body_results, obj_results = run_pipeline(
+            cfg, frames, checkpoint_dir=checkpoint_dir, nusc=nusc,
+        )
+        submission_8class = build_submission(
+            frames=frames,
+            body_results=body_results,
+            obj_results=obj_results,
+            split=split,
+            mapping_name='8class',
+            config=cfg_raw,
+        )
+
+    # (submission_8class kept for remapping below — same structure either way)
 
     print(f'\nWriting submissions to {output_dir}/')
     for mapping in ['8class', '3class', '1class']:

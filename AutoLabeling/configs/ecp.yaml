@@ -2,12 +2,16 @@
 dataset: ecp
 data_root: /media/lleba/ECP_Nuscenes_01/output2/ecp2nuscenes
 version: v1.0-trainval
-camera: CAM_FRONT
+camera: CAM_FRONT         # single-camera fallback / evaluation
+cameras:                  # multi-camera mode; comment out to use single camera only
+  - CAM_FRONT_LEFT
+  - CAM_FRONT
+  - CAM_FRONT_RIGHT
 split: train
 mapping_name: 8class
 
 # ── Output ────────────────────────────────────────────────────────────────────
-output_dir: /home/lleba/Thesis/Development/AutoLabeling/output/ecp
+output_dir: /media/lleba/ECP_Nuscenes_01/autolabeling/output/ecp
 
 # ── Model paths ───────────────────────────────────────────────────────────────
 models:
@@ -34,7 +38,7 @@ thresholds:
 #   o4_ground_filter — CompletionFormer + global PseudoLabeler ground filter before sparse anchors
 #   o5_mask_hdbscan  — CompletionFormer + per-mask HDBSCAN anchor cleaning (no ground filter)
 sam3d_objects:
-  pointmap_mode: o1_lidar
+  pointmap_mode: o3_local_affine
   # O4/O5 settings — used when pointmap_mode is o4_ground_filter or o5_mask_hdbscan
   cformer_ckpt: /home/lleba/Thesis/Development/Models/CompletionFormer/checkpoints/KITTIDC/KITTIDC_L1L2.pt
   lidar_lines: 64      # ECP: 64-beam LiDAR
@@ -48,6 +52,11 @@ sam3d_objects:
   # Prevents occluder (pole/sign) LiDAR depth from bleeding into object interiors.
   # Only active when pointmap_mode is o4_ground_filter or o5_mask_hdbscan.
   hull_anchoring: true
+  # O3 mask erosion: erode binary mask before HDBSCAN point selection to reduce
+  # border bleed-in from adjacent objects. Applies only when pointmap_mode is
+  # o3_local_affine. Set mask_erode_px: 0 to disable.
+  mask_erode_px: 3          # structuring element radius [px] (0 = disabled)
+  mask_erode_min_px: 0      # min mask area [px] to apply erosion (0 = always)
   # O5 proximity selection: when two large clusters both have ≥ proximity_min_pts pts
   # and the second is ≥ proximity_ratio × largest, pick the CLOSER one in ego space.
   proximity_min_pts: 30
@@ -63,35 +72,35 @@ sam3d_objects:
   # so min_cluster_size can be slightly higher than the nuScenes defaults.
   hdbscan:
     pedestrian:
-      min_cluster_size: 3
+      min_cluster_size: 3      # was: 3
       min_samples: 1
       cluster_eps: 0.20
     bicycle:
-      min_cluster_size: 3
+      min_cluster_size: 3      # was: 3
       min_samples: 1
       cluster_eps: 0.20
     motorcycle:
-      min_cluster_size: 3
+      min_cluster_size: 3      # was: 3
       min_samples: 1
       cluster_eps: 0.30
     car:
-      min_cluster_size: 3
+      min_cluster_size: 3      # was: 3
       min_samples: 1
       cluster_eps: 0.50
     truck:
-      min_cluster_size: 5
+      min_cluster_size: 5      # was: 5
       min_samples: 1
       cluster_eps: 0.60
     construction vehicle:
-      min_cluster_size: 5
+      min_cluster_size: 5      # was: 5
       min_samples: 1
       cluster_eps: 0.60
     bus:
-      min_cluster_size: 5
+      min_cluster_size: 5      # was: 5
       min_samples: 1
       cluster_eps: 0.80
     trailer:
-      min_cluster_size: 5
+      min_cluster_size: 5      # was: 5
       min_samples: 1
       cluster_eps: 0.70
 
@@ -121,15 +130,27 @@ lidar_filters:
   ego_box_z_max:  2.5    # upper Z cutoff — preserves tall objects above [m]
   max_range_m:   52.0    # BEV range cutoff (eval limit 50 m + 2 m margin) [m]
 
+# ── Motion compensation (ICP per object) ──────────────────────────────────────
+# Per-object SE(2) ICP motion compensation using multi-sweep LiDAR.
+# Requires lidar_aggregation.use_aggregation=true.
+# ECP has 64-beam LiDAR; single sweeps are dense, so even n_before/after=2
+# gives meaningful temporal context for motion estimation.
+motion_compensation:
+  enabled: false
+  z_ground_min: 0.15
+  turning_yaw_rate: 5.0
+  icp_max_corresp: 0.4
+  terraseg_ckpt: null       # null = auto-download from HuggingFace
+
 # ── LiDAR aggregation ─────────────────────────────────────────────────────────
 # When use_aggregation=true, n_before + anchor + n_after sweeps are combined
 # after ego-motion compensation (all transformed to the anchor ego frame).
 # Denser point clouds improve B1/B2 corrections and O1/O2/O3 LiDAR pointmaps.
 # ECP uses a 64-beam LiDAR → single sweep is already dense; fewer extra sweeps needed.
 lidar_aggregation:
-  use_aggregation: true
-  n_before: 2      # sweeps before anchor keyframe
-  n_after: 2       # sweeps after anchor keyframe
+  use_aggregation: false
+  n_before: 6      # sweeps before anchor keyframe
+  n_after: 6       # sweeps after anchor keyframe
 
 # ── SAM3D Body ─────────────────────────────────────────────────────────────────
 # Controls LiDAR-based post-inference correction for pedestrian meshes.
@@ -176,3 +197,52 @@ prompts:
   truck:                objects
   construction vehicle: objects
   trailer:              objects
+
+# ── OBB size / volume filter ──────────────────────────────────────────────────
+# Applied after OBB fitting, before cross-camera merge.
+# Ego exclusion: OBBs whose center falls within ego_obb_depth metres of the
+# camera along its optical axis are dropped (ego-vehicle artefacts).
+# Volume: both min and max must be satisfied; omit a class to skip that check.
+obb_filter:
+  enabled: false             # set true to activate ego-excl + volume filters
+  ego_obb_depth:
+    CAM_FRONT:       1.0   # [m] hood/bumper visible
+    CAM_BACK:        1.0   # [m] trunk visible
+    CAM_FRONT_LEFT:  1.0   # [m] diagonal — corner of hood
+    CAM_FRONT_RIGHT: 1.0
+    CAM_BACK_LEFT:   1.0
+    CAM_BACK_RIGHT:  1.0
+    CAM_LEFT:        0.5   # [m] side — nearly at car edge
+    CAM_RIGHT:       0.5
+  ego_obb_depth_default: 1.0   # fallback for unlisted cameras
+  min_volume:
+    pedestrian:           0.1
+    bicycle:              1.5
+    motorcycle:           1.5
+    car:                 10.0
+    truck:               15.0
+    bus:                 15.0
+    trailer:             15.0
+    construction vehicle: 15.0
+  max_volume:
+    pedestrian:            8.0
+    bicycle:              15.0
+    motorcycle:           15.0
+    car:                  70.0
+    truck:               300.0
+    bus:                 300.0
+    trailer:             300.0
+    construction vehicle: 300.0
+# ── Cross-camera duplicate suppression ────────────────────────────────────────
+# ECP has three frontal cameras arranged left-to-right.
+cross_camera_merge:
+  enabled: true
+  border_threshold: 0.15
+  bev_overlap_thresh: 0.10
+  compatible_class_groups:
+    - [car, truck]
+    - [motorcycle, bicycle]
+    - [truck, trailer, bus]
+  adjacent_cam_pairs:
+    - [CAM_FRONT_LEFT, CAM_FRONT]
+    - [CAM_FRONT,      CAM_FRONT_RIGHT]

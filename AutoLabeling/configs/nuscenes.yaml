@@ -3,12 +3,19 @@ dataset: nuscenes
 name: nuscenes_mini       # used for output directory and run name
 data_root: /media/lleba/ECP_Nuscenes_01/nuScenes_mini
 version: v1.0-mini
-camera: CAM_FRONT
+camera: CAM_FRONT         # single-camera fallback / evaluation
+# cameras:                  # multi-camera mode; comment out to use single camera only
+#   - CAM_FRONT
+#   - CAM_FRONT_LEFT
+#   - CAM_FRONT_RIGHT
+#   - CAM_BACK
+#   - CAM_BACK_LEFT
+#   - CAM_BACK_RIGHT
 split: train
 mapping_name: 8class
 
 # ── Output ────────────────────────────────────────────────────────────────────
-output_dir: /home/lleba/Thesis/Development/AutoLabeling/output/nuscenes_mini
+output_dir: /media/lleba/ECP_Nuscenes_01/autolabeling/output/nuscenes_mini
 
 # ── Model paths ───────────────────────────────────────────────────────────────
 # null values are resolved automatically relative to dev_root
@@ -36,7 +43,7 @@ thresholds:
 #   o4_ground_filter — CompletionFormer + global PseudoLabeler ground filter before sparse anchors
 #   o5_mask_hdbscan  — CompletionFormer + per-mask HDBSCAN anchor cleaning (no ground filter)
 sam3d_objects:
-  pointmap_mode: o1_lidar
+  pointmap_mode: o3_local_affine
   # O4/O5 settings — used when pointmap_mode is o4_ground_filter or o5_mask_hdbscan
   cformer_ckpt: /home/lleba/Thesis/Development/Models/CompletionFormer/checkpoints/KITTIDC/KITTIDC_L1L2.pt
   lidar_lines: 32      # nuScenes: 32-beam Velodyne
@@ -50,6 +57,11 @@ sam3d_objects:
   # Prevents occluder (pole/sign) LiDAR depth from bleeding into object interiors.
   # Only active when pointmap_mode is o4_ground_filter or o5_mask_hdbscan.
   hull_anchoring: true
+  # O3 mask erosion: erode binary mask before HDBSCAN point selection to reduce
+  # border bleed-in from adjacent objects. Applies only when pointmap_mode is
+  # o3_local_affine. Set mask_erode_px: 0 to disable.
+  mask_erode_px: 3          # structuring element radius [px] (0 = disabled)
+  mask_erode_min_px: 0      # min mask area [px] to apply erosion (0 = always)
   # O5 proximity selection: when two large clusters both have ≥ proximity_min_pts pts
   # and the second is ≥ proximity_ratio × largest, pick the CLOSER one in ego space.
   proximity_min_pts: 30
@@ -65,35 +77,35 @@ sam3d_objects:
   # LiDAR so min_cluster_size is kept lower than ECP defaults.
   hdbscan:
     pedestrian:
-      min_cluster_size: 3
+      min_cluster_size: 3      # was: 3
       min_samples: 1
       cluster_eps: 0.20
     bicycle:
-      min_cluster_size: 3
+      min_cluster_size: 3      # was: 3
       min_samples: 1
       cluster_eps: 0.20
     motorcycle:
-      min_cluster_size: 3
+      min_cluster_size: 3      # was: 3
       min_samples: 1
       cluster_eps: 0.30
     car:
-      min_cluster_size: 3
+      min_cluster_size: 3      # was: 3
       min_samples: 1
       cluster_eps: 0.50
     truck:
-      min_cluster_size: 5
+      min_cluster_size: 5      # was: 5
       min_samples: 1
       cluster_eps: 0.60
     construction vehicle:
-      min_cluster_size: 5
+      min_cluster_size: 5      # was: 5
       min_samples: 1
       cluster_eps: 0.60
     bus:
-      min_cluster_size: 5
+      min_cluster_size: 5      # was: 5
       min_samples: 1
       cluster_eps: 0.80
     trailer:
-      min_cluster_size: 5
+      min_cluster_size: 5      # was: 5
       min_samples: 1
       cluster_eps: 0.70
 
@@ -119,6 +131,23 @@ lidar_filters:
   ego_box_z_min:  0.5    # lower Z cutoff — preserves close ground returns [m]
   ego_box_z_max:  2.5    # upper Z cutoff — preserves tall objects above [m]
   max_range_m:   52.0    # BEV range cutoff (eval limit 50 m + 2 m margin) [m]
+
+# ── Motion compensation (ICP per object) ──────────────────────────────────────
+# Per-object SE(2) ICP motion compensation using multi-sweep LiDAR.
+# Requires lidar_aggregation.use_aggregation=true.
+# When enabled:
+#   - TerraSeg-S removes ground points per sweep before HDBSCAN/ICP
+#   - Phase 1 tracks objects sweep-by-sweep via HDBSCAN centroid propagation
+#   - Phase 2 aligns each sweep to a growing target via SE(2) ICP
+#   - Dynamic objects: ICP heading used for OBB yaw; velocity written to output
+#   - Static objects: PCA yaw disambiguated toward ego heading (road-alignment)
+# When disabled: PCA yaw is still disambiguated, velocity is always 0.
+motion_compensation:
+  enabled: false
+  z_ground_min: 0.15        # Z floor [m] used when TerraSeg fails to load
+  turning_yaw_rate: 5.0     # deg/s — threshold to enable yaw in ICP (not just translation)
+  icp_max_corresp: 0.4      # m — ICP max correspondence distance
+  terraseg_ckpt: null       # null = auto-download from HuggingFace
 
 # ── LiDAR aggregation ─────────────────────────────────────────────────────────
 # When use_aggregation=true, n_before + anchor + n_after sweeps are combined
@@ -176,3 +205,74 @@ prompts:
   truck:                objects
   construction vehicle: objects
   trailer:              objects
+
+# ── OBB size / volume filter ──────────────────────────────────────────────────
+# Applied after OBB fitting, before cross-camera merge.
+# Ego exclusion: OBBs whose center falls within ego_obb_depth metres of the
+# camera along its optical axis are dropped (ego-vehicle artefacts).
+# Volume: both min and max must be satisfied; omit a class to skip that check.
+#
+# min_volume: L × W × H [m³]  (ego-space for objects, camera-space for pedestrians)
+# max_volume: upper bound — catches inflated OBBs from bad reconstructions
+obb_filter:
+  enabled: false             # set true to activate ego-excl + volume filters
+  ego_obb_depth:
+    CAM_FRONT:       1.0   # [m] hood/bumper visible
+    CAM_BACK:        1.0   # [m] trunk visible
+    CAM_FRONT_LEFT:  1.0   # [m] diagonal — corner of hood
+    CAM_FRONT_RIGHT: 1.0
+    CAM_BACK_LEFT:   1.0
+    CAM_BACK_RIGHT:  1.0
+    CAM_LEFT:        0.5   # [m] side — nearly at car edge
+    CAM_RIGHT:       0.5
+  ego_obb_depth_default: 1.0   # fallback for unlisted cameras
+  min_volume:
+    pedestrian:           0.1
+    bicycle:              1.5
+    motorcycle:           1.5
+    car:                 10.0
+    truck:               15.0
+    bus:                 15.0
+    trailer:             15.0
+    construction vehicle: 15.0
+  max_volume:
+    pedestrian:            8.0
+    bicycle:              15.0
+    motorcycle:           15.0
+    car:                  70.0
+    truck:               300.0
+    bus:                 300.0
+    trailer:             300.0
+    construction vehicle: 300.0
+# ── Cross-camera duplicate suppression ────────────────────────────────────────
+# Runs after all per-camera pipelines are complete when multi-camera mode is
+# enabled (cameras: list above has > 1 entry).
+#
+# Two-pass matching per adjacent camera pair, per keyframe:
+#   Main pass  — BEV OBB footprint overlap ≥ bev_overlap_thresh, greedy by
+#                descending overlap.
+#   Fallback   — ResNet18 appearance embedding cosine similarity for any
+#                border candidate still unmatched (greedy, no threshold).
+# The detection with the smaller SAM3 mask is suppressed.
+cross_camera_merge:
+  enabled: true
+  # Fraction of image width that defines the "border zone" on each side.
+  # Left-camera candidates must have their rightmost mask pixel ≥ (1 - border_threshold)*W.
+  # Right-camera candidates must have their leftmost mask pixel ≤ border_threshold*W.
+  border_threshold: 0.15
+  # Minimum BEV footprint overlap (intersection / area_of_smaller_OBB) for the main pass.
+  bev_overlap_thresh: 0.10
+  # Classes that are allowed to match each other across cameras (in addition to same-class).
+  compatible_class_groups:
+    - [car, truck]
+    - [motorcycle, bicycle]
+    - [truck, trailer, bus]
+  # Adjacent camera pairs (left_cam, right_cam).
+  # left_cam: camera whose right border may overlap right_cam's left border.
+  adjacent_cam_pairs:
+    - [CAM_FRONT_LEFT,  CAM_FRONT]
+    - [CAM_FRONT,       CAM_FRONT_RIGHT]
+    - [CAM_FRONT_RIGHT, CAM_BACK_RIGHT]
+    - [CAM_BACK_RIGHT,  CAM_BACK]
+    - [CAM_BACK,        CAM_BACK_LEFT]
+    - [CAM_BACK_LEFT,   CAM_FRONT_LEFT]

@@ -254,7 +254,14 @@ Every option below benefits from denser LiDAR — temporal aggregation is a natu
 
 **This is a novel contribution**: the per-object affine calibration strategy and the HDBSCAN-based surface isolation are your own design. Cite MoGe (Wang et al., 2024) as the depth estimator and HDBSCAN (Campello et al., PAKDD 2013) as the clustering algorithm.
 
-**Code change**: ~40 lines. Add `_compute_moge_local_affine_pointmap(frame, img_rgb, binary_mask)` method to `SAM3DObjectsModel`. Call it per-object inside `run_frame()`. MoGe result is cached per frame to avoid re-running it for every object in the same frame.
+**Code change**: Implemented as `_compute_local_affine_ptmap_for_object()` in `SAM3DObjectsModel`.  MoGe result is cached per frame to avoid re-running for every object.
+
+**O3 mask erosion** *(implemented)*: Before selecting in-mask LiDAR points for HDBSCAN, the binary mask is optionally morphologically eroded (`cv2.erode`, elliptic kernel of radius `mask_erode_px`). This removes border pixels where the mask boundary bleeds into adjacent objects or background — common at depth discontinuities. The un-eroded mask is still used for everything else (affine pointmap construction, crop region). Erosion is skipped if the mask area falls below `mask_erode_min_px` pixels (prevents over-shrinking small objects). Both parameters are config-driven:
+```yaml
+sam3d_objects:
+  mask_erode_px: 3      # structuring element radius [px] (0 = disabled)
+  mask_erode_min_px: 0  # min mask area [px] to apply erosion (0 = always)
+```
 
 **Temporal**: More in-mask LiDAR returns → more stable per-object affine fit, fewer fallbacks to global.
 
@@ -626,8 +633,23 @@ SAM3D Objects:
   SS flow model:       sam3d_objects/model/backbone/tdfy_dit/models/mot_sparse_structure_flow.py
   Preprocess utils:    sam3d_objects/pipeline/preprocess_utils.py
   Our wrapper:         AutoLabeling/src/autolabeling/models/sam3d_objects.py
+    — O3 mask erosion: _compute_local_affine_ptmap_for_object()
+                       mask_erode_px / mask_erode_min_px params (config-driven)
 
-Autolabeling pipeline:
-  Our pipeline:        AutoLabeling/autolabeling_pipeline.ipynb
-  Config:              AutoLabeling/configs/ecp.yaml
+Autolabeling pipeline (full):
+  Entry point:         AutoLabeling/run_pipeline.py
+  Pipeline:            AutoLabeling/src/autolabeling/pipeline.py
+    — run_pipeline()              single-camera pipeline
+    — run_multi_camera_pipeline() multi-camera orchestrator
+    — _apply_obb_filter()         volume pre-filter before cross-camera merge
+  Cross-camera merge:  AutoLabeling/src/autolabeling/cross_camera_merge.py
+    — cross_camera_merge()        two-pass merge (BEV main + ResNet18 fallback)
+  Data loaders:        AutoLabeling/src/autolabeling/data/nuscenes_loader.py
+                       AutoLabeling/src/autolabeling/data/ecp_loader.py
+  Submission writer:   AutoLabeling/src/autolabeling/writers/submission.py
+  Configs:             AutoLabeling/configs/nuscenes.yaml
+                       AutoLabeling/configs/ecp.yaml
+
+Autolabeling pipeline (notebook):
+  Notebook:            Testing/autolabeling_pipeline.ipynb
 ```

@@ -118,3 +118,37 @@ def compute_obb_gravity_aligned(
     yaw_rad     = float(np.arctan2(evecs[1, 0], evecs[0, 0]))
 
     return corners_ego, center_ego, dims, yaw_rad
+
+
+def disambiguate_yaw(yaw_rad: float, ego_heading_rad: float) -> float:
+    """
+    Resolve the 180° ambiguity of a PCA-derived yaw angle.
+
+    PCA gives a long-axis direction but cannot distinguish front from back.
+    For static objects (parked vehicles) the most reliable heuristic is that
+    they are aligned with the road, which is approximately the ego travel
+    direction.  We pick whichever of {yaw, yaw + π} is closest to the ego
+    heading modulo π (i.e. we care about road-alignment, not front/back).
+
+    For dynamic objects the motion heading from ICP trajectory already has the
+    correct sign and should be used directly instead of this function.
+
+    Parameters
+    ----------
+    yaw_rad       : float  PCA yaw in [-π, π] (ambiguous by ±π)
+    ego_heading_rad : float  ego vehicle heading in ego/global frame,
+                             obtained as arctan2(R_e2g @ [1,0,0]) [y, x]
+
+    Returns
+    -------
+    float  disambiguated yaw in [-π, π]
+    """
+    # Two candidates
+    c0 = yaw_rad
+    c1 = yaw_rad + np.pi if yaw_rad < 0 else yaw_rad - np.pi
+
+    def _angular_diff(a, b):
+        d = (a - b + np.pi) % (2 * np.pi) - np.pi
+        return abs(d)
+
+    return c0 if _angular_diff(c0, ego_heading_rad) <= _angular_diff(c1, ego_heading_rad) else c1

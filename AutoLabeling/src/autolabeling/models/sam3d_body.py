@@ -101,12 +101,16 @@ class SAM3DBodyModel:
         K_t = torch.tensor(frame.K, dtype=torch.float32).unsqueeze(0)
 
         # SAM3 masks → pixel xyxy boxes
+        # sam3_mask_indices[j] = index into ped_dets for the j-th SAM3 box
+        # (some ped_dets entries may be skipped when the mask is empty)
         sam3_boxes = []
-        for d in ped_dets:
+        sam3_mask_indices = []
+        for det_idx, d in enumerate(ped_dets):
             ys, xs = np.where(d['binary_mask'])
             if len(xs) == 0:
                 continue
             sam3_boxes.append([xs.min(), ys.min(), xs.max(), ys.max()])
+            sam3_mask_indices.append(det_idx)
         sam3_boxes = (np.array(sam3_boxes, dtype=np.float32)
                       if sam3_boxes else np.empty((0, 4), dtype=np.float32))
 
@@ -137,13 +141,20 @@ class SAM3DBodyModel:
             verts  = np.asarray(o['pred_vertices'],     dtype=np.float32)
             joints = np.asarray(o['pred_keypoints_3d'], dtype=np.float32)
             cam_t  = np.asarray(o['pred_cam_t'],        dtype=np.float32)
+            # sam3_mask_idx: index into ped_dets for SAM3-sourced boxes;
+            # None for ViTDet-only detections (appended after sam3_boxes).
+            sam3_mask_idx = sam3_mask_indices[j] if j < len(sam3_mask_indices) else None
+            binary_mask   = (ped_dets[sam3_mask_idx]['binary_mask']
+                             if sam3_mask_idx is not None else None)
             results.append({
-                'vertices':  verts + cam_t[None, :],
-                'faces':     faces,
-                'joints_3d': joints,
-                'cam_t':     cam_t,
-                'bbox':      merged[j],  # xyxy pixel bbox — used by B1 mask matching
-                'score':     1.0,   # SAM3D Body does not output a per-person confidence
+                'vertices':      verts + cam_t[None, :],
+                'faces':         faces,
+                'joints_3d':     joints,
+                'cam_t':         cam_t,
+                'bbox':          merged[j],
+                'score':         1.0,
+                'sam3_mask_idx': sam3_mask_idx,
+                'binary_mask':   binary_mask,
             })
         return results
 

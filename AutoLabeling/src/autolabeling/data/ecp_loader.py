@@ -14,11 +14,32 @@ from typing import Iterator, List, Optional
 
 from nuscenes.nuscenes import NuScenes
 
-from .nuscenes_loader import FrameRecord, _load_frame, collect_frames, iter_scene_frames
+from .nuscenes_loader import (
+    FrameRecord, _load_frame, collect_frames, collect_frames_multi_cam,
+    iter_scene_frames,
+)
 
 # Re-export so callers can import from either loader module uniformly
 __all__ = ['FrameRecord', 'iter_scene_frames', 'collect_frames',
-           'get_annotated_scene_names', 'collect_annotated_frames']
+           'collect_frames_multi_cam',
+           'get_annotated_scene_names', 'collect_annotated_frames',
+           'collect_annotated_frames_multi_cam']
+
+
+def collect_annotated_frames_multi_cam(
+    nusc: NuScenes,
+    cameras: List[str],
+) -> dict:
+    """
+    Return {camera_name: [FrameRecord]} for annotated keyframes only.
+
+    Identical frame ordering for every camera so that frames_per_cam[cam_A][i]
+    and frames_per_cam[cam_B][i] correspond to the same keyframe.
+    """
+    frames_per_cam = {}
+    for cam in cameras:
+        frames_per_cam[cam] = collect_annotated_frames(nusc, cam)
+    return frames_per_cam
 
 
 def collect_annotated_frames(nusc: NuScenes, camera: str = 'CAM_FRONT') -> List[FrameRecord]:

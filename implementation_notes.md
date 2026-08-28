@@ -140,6 +140,204 @@ sam3d_objects:
 
 ---
 
+### Pre-processing: Per-Object Motion Compensation (ICP)
+
+Before the aggregated multi-sweep point cloud is fed to SAM3D Objects, dynamic objects
+are motion-compensated per mask.  Without this step, a moving car smears across all
+aggregated sweeps, producing an elongated blob that misleads both HDBSCAN clustering
+and SAM3D Objects reconstruction.  Motion compensation collapses all sweeps of a
+dynamic object back to the anchor frame position, yielding a clean dense shape.
+
+The compensation runs in two phases followed by classification.
+
+---
+
+#### Ground removal before Phase 1
+
+Before Phase 1 runs, every sweep's point cloud is ground-filtered so ROI crops contain
+only object-surface returns.
+
+**Exploration notebook** (`lidar_aggregation.ipynb`): **TerraSeg-S** (PointTransformerV3
+backbone, trained on OmniLiDAR) assigns every point a binary label (0 = ground,
+1 = non-ground).  The resulting `sweep_nonground_pts[i]` lists are what Phase 1 crops
+from.  TerraSeg is semantically accurate and handles slopes and kerbs correctly.
+
+**Pipeline notebook** (`autolabeling_pipeline.ipynb`): TerraSeg is not yet integrated
+into the ICP cell.  A simple Z-threshold fallback (`_ICP_Z_GROUND_MIN = 0.15 m`) drops
+points below 15 cm ego-frame height.  This removes most road-surface returns but is
+less robust on sloped roads.  The per-mask Z ceiling filter (`anchor_z_min +
+CLASS_MAX_HEIGHT_M`) applied inside Phase 1 provides a secondary safeguard against
+tall background objects regardless.
+
+**Note**: PseudoLabeler is **not** used for this step.  PseudoLabeler is only used
+in the O4 pointmap pipeline (CompletionFormer ground anchor cleaning) and B1 Stage 2
+(pedestrian foot anchoring) — both of which require a continuous ground-height function
+`z_ground(x, y)` rather than a per-point binary label.
+
+---
+
+#### Phase 1 — Tracking (no alignment)
+
+Starting from the anchor sweep (t=0), walks **forward** (t+1, t+2, …) then **backward**
+(t-1, t-2, …), propagating a search centre sweep-by-sweep.  In each sweep:
+
+1. Crop a local ROI around the last known centroid using `CLASS_SEARCH_RADIUS_M`.
+2. **Z pre-filter before HDBSCAN**: remove points outside
+   `[anchor_z_min − Z_FLOOR_SLACK, anchor_z_min + CLASS_MAX_HEIGHT_M]`.
+   - **Floor** (`anchor_z_min` = bottom of anchor cluster): the object bottom is always
+     LiDAR-visible (it sits on the ground).  Robust, dataset-agnostic.
+   - **Ceiling** (`anchor_z_min + CLASS_MAX_HEIGHT_M`): class-specific cap avoids stealing
+     the cluster from a truck or overpass above the car.  Anchored to the bottom (not the
+     top) so it works even when the roof is not visible in the anchor sweep.
+3. Run HDBSCAN → pick dominant cluster nearest to last search centre (top-3 by size,
+   then min centroid distance).
+4. Update search centre if the centroid moved less than `CLASS_MAX_SPEED_MPS × dt`.
+
+Outputs per sweep: `_sw_pts[i]` (cluster points), `_sw_cents[i]` (cluster centroid).
+No alignment happens here — this phase is purely about locating the object.
+
+---
+
+#### Turning detection (between phases)
+
+The centroid trail from Phase 1 is analysed for heading change before ICP runs:
+
+```python
+def _trajectory_yaw_rate(sw_cents, sw_data):
+    # Split trail into two halves
+    # Fit lstsq velocity direction to each half
+    # Compute net heading change between the two halves
+    # Divide by total time → deg/s
+```
+
+Using **two-half regression** (not step-by-step accumulation) makes this robust to
+per-sweep centroid noise: random jitter averages within each half instead of accumulating
+into a spuriously large total.
+
+- `TURNING_YAW_RATE_DEG_S = 5.0 deg/s` — below this: straight/lane-change → yaw stripped
+- Above threshold: turning → yaw applied in ICP (`allow_yaw=True`)
+
+**Why lane changes don't need yaw**: a lane change is a lateral translation with near-zero
+heading change.  The centroid trail stays parallel → net angle ≈ 0 → no yaw in ICP,
+which is correct (the car body doesn't rotate during a lane change).
+
+---
+
+#### Phase 2 — ICP alignment (growing target)
+
+Sweeps are processed in alternating order **t+1, t-1, t+2, t-2, …** (`zip_longest` of
+forward and backward index lists).  Each sweep is aligned to `_agg_pts` — a **growing
+target cloud** that starts as the anchor cluster and accumulates every successfully
+compensated sweep.
+
+**Why growing target**: the anchor alone is sparse (one LiDAR sweep hits only one side of
+a car).  As sweeps accumulate, `_agg_pts` grows to cover more surfaces → ICP has richer
+correspondences for later sweeps.
+
+**Why alternating order**: sweeps at t+1 and t-1 are temporally close to the anchor and
+move least; their compensation is most accurate.  Their points improve `_agg_pts` before
+sweeps at t+2, t-2 (larger motion) align to it.
+
+**Gate**: sweeps where Phase 1 found no valid cluster (`_sw_cents[i] is None`) are skipped
+entirely.  Without the gate, the raw ROI crop (background noise, wrong centroid) would be
+passed to `centroid_T`, producing a wildly wrong initialisation.
+
+**Initialisation**: `centroid_T` translates the source cloud so its XY centroid matches the
+target centroid.  This coarse shift handles the full object displacement; ICP then only
+refines the residual shape-level misalignment.  Because `centroid_T` is used, the tight
+`ICP_MAX_CORRESP = 0.4 m` is valid — ICP only needs to close the small remaining gap.
+
+---
+
+#### ICP metric — point-to-point vs. point-to-plane
+
+| Metric | When to use | Why |
+|---|---|---|
+| **Point-to-point** | pedestrian, bicycle, motorcycle | 3D body/frame structure; distinct corners and edges provide good correspondences from all directions. Normals are unreliable on sparse, non-planar clouds. |
+| **Point-to-plane** | car, van, truck, bus, construction vehicle | Flat side-wall panels. Point-to-point has no constraint perpendicular to the wall (any slide is equally good → lateral smear). Point-to-plane penalises offset along the surface normal, directly constraining the lateral direction. |
+
+Normals for point-to-plane are estimated on the **target** cloud (`_agg_pts`) using a
+neighbourhood of `ICP_MAX_CORRESP × 3 m` and oriented toward the ego vehicle at `(0,0,100)`
+(upper hemisphere → consistent orientation regardless of object position in the scene).
+Normals on the growing cloud improve as more sweeps accumulate.
+
+**`allow_yaw` flag**: for straight-driving objects, the ICP rotation output is discarded
+(only translation used).  Without this, ICP on an elongated car body finds a spurious local
+minimum that includes large yaw — the car shape looks the same after a 180° rotation.
+
+---
+
+#### Final cloud
+
+| Object state | Final cloud |
+|---|---|
+| **Dynamic** | Concatenation of all ICP-compensated per-sweep clusters |
+| **Static** | All raw in-mask points from every sweep → HDBSCAN dominant cluster (no ICP; raw aggregation is correct for stationary objects) |
+
+---
+
+#### Downstream routing (static vs dynamic)
+
+After motion compensation, the final cloud feeds two different downstream paths based on object class.
+
+**Non-pedestrian objects → SAM3D Objects**
+
+`run_frame` checks the `is_dynamic` flag from the ICP result per mask:
+- **Static**: the raw aggregated ego-frame cloud (`o3_data['pts_ego_vis']`) is passed directly to
+  `_compute_local_affine_ptmap_for_object`.  No ICP is involved.  HDBSCAN runs once *inside*
+  that function to isolate the dominant surface cluster before the local affine fit.
+- **Dynamic**: the ICP-compensated cloud (`_icp_meta['pts_ego_vis']`) replaces the aggregated
+  cloud as input to the same function.  HDBSCAN still runs once inside `_compute_local_affine_ptmap_for_object`
+  to clean the ICP output before fitting.
+
+In both cases HDBSCAN runs exactly once inside `_compute_local_affine_ptmap_for_object`.
+There is no additional clustering step between the ICP output and SAM3D Objects inference.
+
+**Pedestrian objects → SAM3D Body / B1 Stage 1**
+
+The same static/dynamic split applies, but the cloud is consumed by B1 depth correction:
+- **Static**: the aggregated in-mask ego-frame cloud is filtered by `filter_inmask_lidar_hdbscan`
+  → dominant cluster → `median(Z_vis[keep])` → `tz_lidar`.  No ICP lookup.
+- **Dynamic**: the ICP cloud is retrieved from `mc_pts_by_mask_id` (a dict keyed by
+  `id(binary_mask)` for each SAM3-sourced pedestrian mask, built from dynamic-only ICP results)
+  → filtered by `filter_inmask_lidar_hdbscan` → surviving cluster is projected from ego to camera
+  frame via `R_c2e.T @ (pts − t_c2e).T` → the Z (depth) column of the result → `tz_lidar`.
+
+The ego→camera projection is a 3-D coordinate frame transform, not a 2-D pixel projection.
+Only the Z component (camera-space depth) is needed.
+
+`mc_pts_by_mask_id` is populated before B1 runs and contains only **dynamic** pedestrian results.
+Static pedestrians have no ICP entry and use the aggregated sweep directly.
+
+---
+
+#### Fallback
+
+When `USE_ICP=False` or no ICP sweep data is available, the cell falls back to the
+pre-ICP pipeline: project the single anchor sweep's in-mask LiDAR into camera, run
+HDBSCAN on the anchor-sweep points, and use the dominant cluster as `pts_comp_all`.
+This keeps the output dict format identical so all downstream cells are unaffected.
+
+---
+
+#### Config (`Testing/lidar_aggregation.ipynb` cell `cell-motion`, pipeline cell `icp-motion-cell`)
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `ICP_MAX_CORRESP_DIST` | 0.4 m | Max point-pair distance in ICP (valid because centroid init handles coarse offset) |
+| `ICP_MAX_ITER` | 60 | ICP convergence iterations |
+| `MIN_PTS_ICP` | 8 | Min points to attempt ICP (else centroid-only) |
+| `Z_ANCHOR_FLOOR_SLACK` | 0.20 m | Extra slack below anchor bottom for Z pre-filter |
+| `CLASS_MAX_HEIGHT_M` | per class | Ceiling above anchor bottom for Z pre-filter |
+| `TURNING_YAW_RATE_DEG_S` | 5.0 deg/s | Threshold for turning detection |
+| `CLASS_ICP_METRIC` | per class | `'p2l'` or `'p2p'` per class |
+
+**Code**:
+- Exploration notebook: `Testing/lidar_aggregation.ipynb` — cell `cell-motion`
+- Pipeline: `Testing/autolabeling_pipeline.ipynb` — cells `icp-motion-hdr`, `icp-motion-cell`
+
+---
+
 ### Pre-processing: Multi-Sweep LiDAR Aggregation
 
 Before any of the O1/O2/O3/B1 paths run, the per-frame LiDAR point cloud can be built from
@@ -168,12 +366,24 @@ entries pointing to the same `.bin` file.  The sweep-walking code (`_walk_lidar_
 any token whose resolved file path has already been seen, so each physical sweep is included
 exactly once.
 
+**Sweep counts per dataset**:
+
+| Dataset | LiDAR rate | Keyframe rate | Sweeps between keyframes |
+|---------|-----------|---------------|--------------------------|
+| nuScenes | 20 Hz | 2 Hz (annotated) | 9 non-keyframe + 1 keyframe = **10 total** |
+| ECP | ~20 Hz | ~20 Hz (every frame is a keyframe in the nuScenes export) | 0 non-keyframe sweeps; N_BEFORE walks to prior annotated keyframes directly |
+
+For nuScenes, `N_BEFORE=10` / `N_AFTER=10` captures **exactly one full keyframe interval** in each direction: the 9 intermediate non-annotated sweeps plus the neighbouring annotated keyframe.  This is the natural maximum — going beyond 10 would cross into the keyframe interval two steps away.
+
+ECP annotates only a sparse subset of keyframes (~33 annotated out of thousands).  Between two consecutive annotated ECP frames there are many non-annotated keyframes.  `N_BEFORE` / `N_AFTER` walk the LiDAR linked list from the annotated anchor and pick up the nearest non-annotated sweeps in each direction.
+
 **Config** (per dataset — values tuned to LiDAR beam count):
 ```yaml
 lidar_aggregation:
   use_aggregation: true
   n_before: 3    # nuScenes (32-beam): more sweeps to compensate sparse density
   n_after:  3
+  # n_before=10 / n_after=10 covers exactly one full keyframe interval (±500 ms)
 
 lidar_aggregation:
   use_aggregation: true
@@ -430,6 +640,29 @@ that is globally metric and accurate for close large objects.
 
 See also edge case E5.
 
+**Mask erosion before HDBSCAN (O3)**
+
+Before selecting in-mask LiDAR points for HDBSCAN, the SAM3 binary mask is eroded by
+`MASK_ERODE_PX` pixels using an elliptical structuring element.  Erosion shrinks the mask
+inward so that LiDAR returns near the mask boundary — which may belong to the adjacent
+background or a neighbouring object that bleeds into the mask edge — are excluded from the
+clustering step.  The un-eroded mask is still used for the final pointmap build and the
+global fallback affine fit.
+
+```
+eroded_mask = cv2.erode(binary_mask, ellipse(2·MASK_ERODE_PX+1))
+in_mask     = eroded_mask[v_int, u_int]   ← only eroded mask selects HDBSCAN points
+```
+
+Erosion is skipped when `MASK_ERODE_PX = 0` or when the mask area is below
+`MASK_ERODE_MIN_PX` pixels (to avoid over-eroding very small masks to zero).
+
+**Config** (Cell 4 in notebook):
+```python
+MASK_ERODE_PX     = 3   # pixels to erode (0 = disabled)
+MASK_ERODE_MIN_PX = 0   # min mask area [px] to apply erosion (0 = always)
+```
+
 **Code**
 - Full pipeline: `SAM3DObjectsModel._compute_local_affine_ptmap_for_object()` in
   `AutoLabeling/src/autolabeling/models/sam3d_objects.py`.
@@ -472,6 +705,58 @@ lidar_lines    = 32      (nuScenes) / 64 (ECP)
 5. Same fixed pointmap passed to all SAM3D Objects calls for that camera — no HDBSCAN, no MoGe
 
 **Fallback**: if no LiDAR is available for a frame, falls back to MoGe baseline.
+
+---
+
+#### Hull Anchoring  *(O4 / O5 / O6)*
+
+**Problem it solves**: CompletionFormer is run with `preserve_input=True`, which
+hard-anchors the output at every pixel that has a LiDAR return — the network's predicted
+depth there is overridden with the raw measured depth.  Ground-plane LiDAR returns that
+project inside a foreground object's mask are therefore anchored to road depth (~2–8 m)
+even though the object itself is further away.  The network then interpolates from these
+wrong anchor points outward inside the mask, producing a depth map that is too shallow
+across part of the object interior.  The resulting SAM3D OBB is shifted toward the camera.
+
+**Fix**: after CompletionFormer produces the dense depth map, for each object mask:
+1. Find in-mask LiDAR returns and run HDBSCAN to isolate the dominant cluster
+   (same per-class params and erosion as O3 / Step 0).
+2. Compute `min_depth = 5th-percentile of cluster depths − HULL_Z_MARGIN`.
+   The 5th percentile is used (not the minimum) to guard against stray near outliers.
+3. Build the convex hull of the SAM3 mask pixels in image space.
+4. Clamp: `dense_depth[hull_pixels] = max(dense_depth[hull_pixels], min_depth)`.
+   This raises any pixel inside the hull that is shallower than the LiDAR evidence allows.
+
+The hull fill (step 3–4) uses the **full** (un-eroded) mask; erosion only applies to
+HDBSCAN point selection (step 1), for the same border-bleed reason as in O3.
+
+**Why hull, not just the mask pixels**: the HDBSCAN-cleaned LiDAR cluster may only cover
+part of the mask (e.g. the front face of a car).  The convex hull of the mask ensures the
+floor is applied over the entire projected object region, not just where LiDAR points land.
+
+**Config**:
+```python
+HULL_ANCHORING = True    # enable/disable
+HULL_Z_MARGIN  = 0       # [m] safety margin subtracted from 5th-pct depth
+```
+
+**Why NOT hull anchoring for O3**
+
+O3 uses MoGe + per-object affine scaling, not CompletionFormer.  The problem hull
+anchoring fixes — wrong hard-anchored pixels from ground returns — does not arise in O3:
+
+- O3 does not hard-anchor anything.  The affine transform `Z_metric = a·Z_moge + b` is
+  applied uniformly across the full map; there is no `preserve_input` mechanism.
+- MoGe produces a smoothly-varying relative depth surface.  There are no specific pixels
+  that are forced to road depth.  The pathology hull anchoring corrects simply does not exist.
+- O3's main error mode is an inaccurate affine scale for large close objects (§ E5) — a
+  per-object scale-and-shift issue.  Setting a depth floor inside the hull would be a
+  no-op in most cases (the affine-scaled depth is already at the right level) and could
+  not fix the underlying scale error where the fit is bad.
+
+In summary: hull anchoring targets a CompletionFormer-specific artifact caused by
+`preserve_input=True`.  O3 has a different error profile that affine scaling addresses
+directly; adding a depth floor on top would not help and could introduce new artifacts.
 
 ---
 
@@ -865,6 +1150,31 @@ B2_GROUND_CORRECTION = True   # enable/disable Stage 2 independently
 - PseudoLabeler: `TerraSeg/PseudoLabeler_scripts/pseudolabeler_model.py`
 - Notebook reference: `Testing/sam3d_body_pipeline.ipynb`
 
+---
+
+#### Mask identification — `sam3_mask_idx` and `binary_mask`
+
+Each SAM3D Body result dict carries two fields that enable O(1) mask lookup in B1 and the
+cross-camera merge, replacing the previous fragile IoU-based search:
+
+| Field | Content | When populated |
+|---|---|---|
+| `sam3_mask_idx` | Integer index into `ped_dets` (the SAM3 pedestrian detection list) | Always; `None` for ViTDet-only detections |
+| `binary_mask` | `ped_dets[sam3_mask_idx]['binary_mask']` | SAM3-sourced detections only; `None` for ViTDet-only |
+
+B1 Stage 1 uses `sam3_mask_idx` for a direct `ped_dets[sam3_mask_idx]['binary_mask']` lookup.
+No IoU search is needed; the association is exact by construction since `SAM3DBodyModel.run_frame`
+iterates the same `ped_dets` list in order when building bounding boxes from SAM3 masks.
+
+**ViTDet-only detections** are those appended after all SAM3-sourced boxes — ViTDet is a
+bbox-only detector that provides no segmentation mask:
+- `sam3_mask_idx = None`, `binary_mask = None`
+- B1 Stage 1: a rectangular mask is constructed from the ViTDet bbox for in-mask LiDAR selection
+- Dynamic ICP path: skipped (no `binary_mask` means no lookup key in `mc_pts_by_mask_id`)
+- Cross-camera merge Stage 1 border check: silently skipped (no `binary_mask` to test)
+
+---
+
 **HDBSCAN params** (Stage 1): uses the pedestrian entry from the per-class HDBSCAN config
 (`sam3d_objects.hdbscan.pedestrian`), currently `min_cluster_size=3`, `min_samples=1`,
 `cluster_eps=0.20 m`.  The same `filter_inmask_lidar_hdbscan()` utility is shared with O3;
@@ -965,6 +1275,337 @@ for near-uniform-depth regions.
 - O5 (`o5_mask_hdbscan`) — same CompletionFormer backend but uses per-mask HDBSCAN to
   clean ground returns from the sparse anchor; no PseudoLabeler needed.  Implemented and
   evaluated — TP errors (AOE, ASE) improve over O3; mAP is comparable.
+
+---
+
+---
+
+## 6. Multi-Camera Setup
+
+### Overview
+
+The pipeline processes every available camera for a given frame and aggregates detections
+across all views.  A single shared ego-frame LiDAR cloud is loaded once and then projected
+separately into each camera's image plane.
+
+### Camera configurations
+
+| Dataset | Cameras | Notes |
+|---|---|---|
+| nuScenes | `CAM_FRONT`, `CAM_FRONT_LEFT`, `CAM_FRONT_RIGHT`, `CAM_BACK`, `CAM_BACK_LEFT`, `CAM_BACK_RIGHT` | Full 360° coverage, 6 cameras |
+| ECP | `CAM_FRONT_LEFT`, `CAM_FRONT`, `CAM_FRONT_RIGHT` | Frontal arc only, 3 cameras |
+
+### nuScenes mini — train/val split
+
+The pipeline runs on `split: train` → `mini_train` (8 scenes, ~323 keyframes).
+`mini_val` (2 scenes) is kept untouched for evaluation.
+
+**mini_train** (pseudo-label generation):
+
+| Scene | Description |
+|---|---|
+| scene-0061 | Parked truck, construction, intersection, turn left |
+| scene-0553 | Wait at intersection, bicycle, large truck, peds crossing |
+| scene-0655 | Parking lot, parked cars, jaywalker, bendy bus, gardening vehicle |
+| scene-0757 | Arrive at busy intersection, bus, wait at intersection, bicycle |
+| scene-0796 | Scooter, peds on sidewalk, bus, cars, truck |
+| scene-1077 | Night, big street, bus stop, high speed, construction vehicle |
+| scene-1094 | Night, after rain, many peds, PMD, ped with bag, jaywalker |
+| scene-1100 | Night, peds in sidewalk, peds cross crosswalk, scooter, PMD |
+
+**mini_val** (evaluation only — not labelled by pipeline):
+
+| Scene | Description |
+|---|---|
+| scene-0103 | Many peds right, wait for turning car, long bike rack left |
+| scene-0916 | Parking lot, bicycle rack, parked bicycles, bus, many peds |
+
+ECP also contains `CAM_FRONT2` (a stereo camera at the same position as `CAM_FRONT`), but this
+channel is intentionally **excluded**.  Including it would produce duplicate detections in the
+same FoV that the cross-camera merge (§7) would not catch, since the two images have the same
+viewing direction and no object would be at an image border.
+
+### Config
+
+Multi-camera mode is enabled by including a `cameras:` list in the YAML config.  Removing or
+commenting it out falls back to the single `camera:` field.
+
+```yaml
+camera: CAM_FRONT         # single-camera fallback / evaluation
+cameras:                  # multi-camera mode; comment out to use single camera only
+  - CAM_FRONT_LEFT
+  - CAM_FRONT
+  - CAM_FRONT_RIGHT
+```
+
+When `cameras:` has more than one entry the full pipeline automatically uses
+`run_multi_camera_pipeline` and `build_submission_multi_cam`.  No CLI flag is needed.
+
+### Pipeline behaviour
+
+`run_multi_camera_pipeline` in `AutoLabeling/src/autolabeling/pipeline.py` loops
+`run_pipeline` once per camera, using a per-camera checkpoint subdirectory
+(`checkpoint_dir/<cam_name>/`) to avoid collisions.  Results are stored in per-camera dicts:
+`body_results_all[cam]`, `obj_results_all[cam]`.
+
+LiDAR is loaded once in ego frame inside each `run_pipeline` call and projected into that
+camera independently using its `R_c2e`, `t_c2e` calibration.  OBBs for objects are computed
+in ego space and are directly comparable across cameras.  Body OBBs are in camera space and
+are transformed to ego via `R_c2e @ corners.T + t_c2e` whenever ego-space comparison is
+needed (rider merge, cross-camera merge).
+
+After all per-camera pipelines finish, `cross_camera_merge` is called if
+`cross_camera_merge.enabled: true` in the config (§7).
+
+Single-camera mode (no `cameras:` field, or `cameras:` contains only one entry) runs only
+the single `camera:` value and skips the cross-camera merge.
+
+### Code
+
+- Notebook: `Testing/autolabeling_pipeline.ipynb` — config cell (Cell 4), multi-cam config
+  cell (Cell 5), all inference cells loop over `CAMERAS`
+- Full pipeline entry point: `AutoLabeling/run_pipeline.py` — reads `cameras:` from YAML,
+  computes `_multi_cam = bool(_cameras_list and len(_cameras_list) > 1)`, routes to
+  `run_multi_camera_pipeline` or `run_pipeline`
+- Pipeline: `AutoLabeling/src/autolabeling/pipeline.py` — `run_multi_camera_pipeline()`,
+  `run_pipeline()`
+- Configs: `AutoLabeling/configs/ecp.yaml`, `AutoLabeling/configs/nuscenes.yaml`
+
+---
+
+## 7. Cross-Camera Duplicate Suppression
+
+### Problem
+
+An object near the seam between two adjacent cameras is often detected independently in both
+views — once in the left camera (mask at the right image edge) and once in the right camera
+(mask at the left image edge).  Without suppression this yields two separate OBBs for the
+same physical object.
+
+### Why not VESPA's merging strategy
+
+VESPA (`/home/lleba/VESPA/src/image/object_merge.py`) implements two merging strategies:
+
+1. **Camera-mask + LiDAR cluster match**: checks border pixel positions (same idea as our
+   Stage 1), then computes minimum Euclidean distance between the raw **LiDAR point clusters**
+   of the two candidates, or counts exact-coordinate overlapping points (distance < 1e-6 m)
+   between clusters.
+2. **VLM-to-clustering merge**: fuses camera-based VLM detections with a separate
+   LiDAR-clustering detection pathway, using LiDAR point-ratio thresholds between both sets.
+
+Both strategies fundamentally depend on **per-object LiDAR point clusters**.  VESPA retains the
+set of raw LiDAR returns that were assigned to each detection throughout its pipeline — these
+are available because VESPA runs LiDAR spatial clustering as a parallel detection branch.
+
+Our pipeline does not produce per-object LiDAR clusters.  LiDAR is used only for depth
+calibration inside each camera's `run_pipeline` call (affine scale fit for O3, dense
+completion for O4/O5); the outputs are OBBs and meshes, not point clouds.  At merge time
+there is no LiDAR cluster to compare.
+
+Additionally, VESPA's VLM-to-clustering strategy is not applicable here because we have no
+separate LiDAR clustering branch — all detections come from SAM3 + SAM3D.
+
+**Our alternative** is therefore built entirely on what we do have: the fitted OBBs (for BEV
+geometric overlap) and the original camera crops (for appearance embedding fallback).  BEV OBB
+overlap is arguably a stronger signal than raw LiDAR cluster distance anyway — it operates in
+the same evaluation space used by nuScenes mAP and is not affected by LiDAR sparsity.
+
+### Stage 0 — OBB post-filters (ego-body exclusion + volume)
+
+Before any cross-camera matching, two filters are applied to every per-camera detection.
+Both run at the end of `run_pipeline`, after OBB fitting and rider merge, in this order:
+
+#### 0a — Ego-body exclusion
+
+Catches ego-vehicle parts (hood, bumper, trunk) that SAM3 segments as a real object —
+most commonly the front hood appearing as `"car"` in `CAM_FRONT`.
+
+For each camera, the filter checks whether an OBB center lies within `D` metres of the
+camera along its **optical axis** in ego frame:
+
+```
+fwd_ego   = R_c2e @ [0, 0, 1]          # camera forward direction in ego space
+d_along   = dot(obb_center_ego − t_c2e, fwd_ego)
+excluded  = 0.0 ≤ d_along ≤ D
+```
+
+`D` is read per camera name from `obb_filter.ego_obb_depth` in the YAML config; a fallback
+`ego_obb_depth_default` is used for any unlisted camera name.  Body OBB centers (camera
+space) are first transformed to ego space via `R_c2e @ center + t_c2e`.
+
+**Why camera-extrinsic-based, not a hardcoded box**: the exclusion zone origin is placed
+exactly where the camera sits on the vehicle (from `calibrated_sensor` metadata) and extends
+in the camera's actual viewing direction.  This is dataset-agnostic — any vehicle whose
+cameras are described by nuScenes-format calibration automatically gets the correct zone
+geometry.  Only the depth `D` (how far ahead the camera can see ego bodywork) is a tuned
+constant; ego vehicle dimensions themselves are not stored in nuScenes metadata.
+
+**Limitation**: `D` is still a fixed approximation per camera position.  A fully data-driven
+approach would derive it from the LiDAR point cloud (ego-body returns define the vehicle
+boundary), but this adds complexity without substantially improving accuracy given the
+narrow physical range of passenger car dimensions.
+
+**Per-camera depth values (current)**
+
+| Camera | D (m) | Rationale |
+|---|---|---|
+| `CAM_FRONT` | 1.0 | Hood fully visible |
+| `CAM_BACK` | 1.0 | Trunk visible |
+| `CAM_FRONT_LEFT/RIGHT` | 1.0 | Diagonal — hood corner |
+| `CAM_BACK_LEFT/RIGHT` | 1.0 | Diagonal — trunk corner |
+| `CAM_LEFT/RIGHT` | 0.5 | Side cameras — nearly at car edge |
+| *(default)* | 1.0 | Fallback for unlisted cameras |
+
+#### 0b — Volume filter (min and max)
+
+`OBB volume = L × W × H` (ego space for objects; camera space for bodies) must fall within
+a per-class `[min_volume, max_volume]` range.
+
+- **Min** catches collapsed/micro-sized boxes from bad depth estimates or very thin masks.
+- **Max** catches inflated/ballooned boxes from close objects with poorly constrained mesh
+  reconstruction (e.g. a nearby car that MoGe reconstructs as an enormous slab).
+
+Per-axis dimension checks (`min_l`, `min_h`) are not used in the full pipeline — the volume
+range is stricter and simpler.
+
+**Per-class volumes (current values)**
+
+| Class | Min (m³) | Max (m³) |
+|---|---|---|
+| `pedestrian` | 0.1 | 8.0 |
+| `bicycle` | 1.5 | 15.0 |
+| `motorcycle` | 1.5 | 15.0 |
+| `car` | 10.0 | 70.0 |
+| `truck` | 15.0 | 300.0 |
+| `bus` | 15.0 | 300.0 |
+| `trailer` | 15.0 | 300.0 |
+| `construction vehicle` | 15.0 | 300.0 |
+
+### Stage 1 — Border check
+
+For each adjacent camera pair `(left_cam, right_cam)`, border-touching candidates are
+collected:
+
+- **Left camera**: detection mask must reach the right image edge —
+  `rightmost_pixel_x / W ≥ 1 − border_threshold` (default `0.15`).
+- **Right camera**: detection mask must touch the left image edge —
+  `leftmost_pixel_x / W ≤ border_threshold`.
+
+Both cameras are checked simultaneously per pair — the seam is fully covered in one pass.
+Detections without a `binary_mask` (e.g. ViTDet-only pedestrian body results, which have
+`binary_mask=None` because ViTDet provides no segmentation) are silently skipped; they
+cannot participate in the merge.  SAM3-sourced body results carry a valid `binary_mask`
+(populated via `sam3_mask_idx` during SAM3D Body inference) and do participate.
+
+### Stage 2 — BEV overlap matching (main pass)
+
+For all border-touching candidate pairs that pass a class-compatibility check
+(`[car, truck]`, `[motorcycle, bicycle]`, `[truck, trailer, bus]`, or identical labels),
+BEV OBB footprint overlap is computed and pairs are assigned greedily by descending overlap.
+
+**BEV overlap**: `overlap_fraction = intersection_area / area(smaller OBB)` in the
+top-down (XY) bird's-eye-view projection.  Implemented via `shapely.Polygon.intersection`
+on the convex hull of the 8 OBB corners projected to the XY plane.  Body OBB corners are
+first transformed from camera space to ego space (`R_c2e @ corners.T + t_c2e`) before
+the BEV projection.
+
+**Main pass**: pairs are sorted by descending BEV overlap.  A pair is accepted when
+`overlap_fraction ≥ bev_overlap_thresh` (default `0.10` = 10 %).  Each detection can
+only appear in one accepted pair (1-to-1 assignment).
+
+**Why BEV instead of 3D volume overlap**: height estimation from SAM3D is the least
+reliable dimension (depth ambiguity is mostly vertical).  BEV overlap is also the standard
+evaluation metric in autonomous driving.
+
+### Stage 3 — Appearance embedding fallback
+
+After the main pass, any border-touching candidate that is still unmatched is paired with
+the best remaining candidate by **ResNet18 cosine similarity** — no threshold applied.
+A ResNet18 (truncated at global pool, eval mode) embeds each candidate's image crop; the
+most similar unmatched partner (greedy, descending similarity) is accepted.
+
+This fallback handles cases where BEV overlap is near-zero due to poor depth estimation but
+the two crops are visually identical (same object, two camera angles).  It also ensures
+every border detection gets a partner if one is available, rather than leaving a duplicate
+alive.  The fallback is skipped if there are no remaining unmatched border candidates.
+
+### Decision: which detection to keep
+
+The detection whose **SAM3 mask covers more pixels** (`binary_mask.sum()`) is kept.
+A larger mask means SAM3 captured more of the object surface and passed more image
+information downstream to SAM3D — so that camera view yields better 3D reconstruction.
+The smaller-mask detection is suppressed (removed from `body_results_all` / `obj_results_all`).
+
+### Adjacent camera pairs (ordered left → right)
+
+**nuScenes** (6 pairs, full circle):
+`CAM_FRONT_LEFT↔CAM_FRONT`, `CAM_FRONT↔CAM_FRONT_RIGHT`, `CAM_FRONT_RIGHT↔CAM_BACK_RIGHT`,
+`CAM_BACK_RIGHT↔CAM_BACK`, `CAM_BACK↔CAM_BACK_LEFT`, `CAM_BACK_LEFT↔CAM_FRONT_LEFT`
+
+**ECP** (2 pairs, frontal arc):
+`CAM_FRONT_LEFT↔CAM_FRONT`, `CAM_FRONT↔CAM_FRONT_RIGHT`
+
+### Config (full pipeline YAML)
+
+```yaml
+obb_filter:
+  ego_obb_depth:
+    CAM_FRONT:       1.0
+    CAM_BACK:        1.0
+    CAM_FRONT_LEFT:  1.0
+    CAM_FRONT_RIGHT: 1.0
+    CAM_BACK_LEFT:   1.0
+    CAM_BACK_RIGHT:  1.0
+    CAM_LEFT:        0.5
+    CAM_RIGHT:       0.5
+  ego_obb_depth_default: 1.0
+  min_volume:
+    pedestrian:           0.1
+    bicycle:              1.5
+    motorcycle:           1.5
+    car:                 10.0
+    truck:               15.0
+    bus:                 15.0
+    trailer:             15.0
+    construction vehicle: 15.0
+  max_volume:
+    pedestrian:            8.0
+    bicycle:              15.0
+    motorcycle:           15.0
+    car:                  70.0
+    truck:               300.0
+    bus:                 300.0
+    trailer:             300.0
+    construction vehicle: 300.0
+
+cross_camera_merge:
+  enabled: true
+  border_threshold: 0.15
+  bev_overlap_thresh: 0.10
+  compatible_class_groups:
+    - [car, truck]
+    - [motorcycle, bicycle]
+    - [truck, trailer, bus]
+  adjacent_cam_pairs:               # nuScenes example
+    - [CAM_FRONT_LEFT,  CAM_FRONT]
+    - [CAM_FRONT,       CAM_FRONT_RIGHT]
+    - [CAM_FRONT_RIGHT, CAM_BACK_RIGHT]
+    - [CAM_BACK_RIGHT,  CAM_BACK]
+    - [CAM_BACK,        CAM_BACK_LEFT]
+    - [CAM_BACK_LEFT,   CAM_FRONT_LEFT]
+```
+
+### Code
+
+- Notebook: `Testing/autolabeling_pipeline.ipynb` — Cell 4 (config: `EGO_OBB_DEPTH`, `OBB_MIN/MAX_VOLUME`),
+  Cell 29 (`obb_in_ego_excl()` + combined filter loop + BEV visualisation with exclusion wedges)
+- Full pipeline ego-excl filter: `_apply_ego_obb_excl_filter()` in `AutoLabeling/src/autolabeling/pipeline.py`
+  — runs first, before volume filter, at end of `run_pipeline()`
+- Full pipeline volume filter: `_apply_obb_filter()` in `AutoLabeling/src/autolabeling/pipeline.py`
+  — accepts both `min_volume` and `max_volume` dicts; called immediately after ego-excl filter
+- Full pipeline merge: `AutoLabeling/src/autolabeling/cross_camera_merge.py` —
+  `cross_camera_merge()`, `_bev_overlap()`, `_embed_model()`, `_get_embed()`
+- Called from: `run_multi_camera_pipeline()` in `AutoLabeling/src/autolabeling/pipeline.py`
 
 ---
 

@@ -192,3 +192,147 @@ The report contains:
 - **Page 2**: per-class AP bar chart with mAP reference line
 - **Page 3**: precision–recall curves for all classes (at 2.0 m threshold)
 - **Page 4**: per-class TP error bars (ATE, ASE, AOE, AVE, AAE)
+
+---
+
+## BEV / Perspective Visualization
+
+`visualize_autolabeling_results.py` generates ego-centred LiDAR videos with pseudo-label and GT boxes overlaid.
+Run from the `autolabeling` conda environment inside the `Evaluation/` directory.
+
+### CLI flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--view bev\|perspective` | `bev` | Top-down flat boxes or elevated 3D wireframe view |
+| `--annotated-only` | off | Render only frames that have pseudo-labels |
+| `--combine` | off | All scenes into one video (instead of one file per scene) |
+| `--compare-dir DIR` | — | Split-screen vs per-scene VESPA outputs (ECP structure) |
+| `--compare-json FILE` | — | Split-screen vs a single comparison JSON (nuScenes VESPA) |
+| `--left-label TEXT` | `Ours` | Label shown above left panel |
+| `--compare-label TEXT` | `VESPA` | Label shown above right panel |
+| `--fps N` | 1 (annotated) / 20 | Video frame rate |
+| `--scene NAME` | — | Process one scene only |
+| `--all-scenes` | off | Process all scenes, not just those with pseudo-labels |
+| `--data-root DIR` | ECP root | Dataset root directory |
+| `--version STR` | `v1.0-trainval` | nuScenes version string |
+| `--label-json FILE` | ECP 8class JSON | Pseudo-label results JSON |
+| `--out-dir DIR` | `~/Desktop/bev_videos` | Output directory |
+
+Output videos are saved to `~/Desktop/bev_videos/`.
+
+---
+
+### ECP — all commands
+
+```bash
+cd /home/lleba/Thesis/Development/Evaluation
+conda activate autolabeling
+```
+
+**BEV, all frames, per-scene files:**
+```bash
+python visualize_autolabeling_results.py
+```
+
+**BEV, annotated only, per-scene files:**
+```bash
+python visualize_autolabeling_results.py --annotated-only
+```
+
+**BEV, annotated only, combined video:**
+```bash
+python visualize_autolabeling_results.py --annotated-only --combine
+```
+
+**BEV, annotated only, combined, vs VESPA:**
+```bash
+python visualize_autolabeling_results.py --annotated-only --combine \
+    --compare-dir /home/lleba/VESPA/outs/vlm/p_final_ecp_all_cameras
+```
+
+**Perspective, annotated only, per-scene files:**
+```bash
+python visualize_autolabeling_results.py --view perspective --annotated-only
+```
+
+**Perspective, annotated only, combined video:**
+```bash
+python visualize_autolabeling_results.py --view perspective --annotated-only --combine
+```
+
+**Perspective, annotated only, combined, vs VESPA:**
+```bash
+python visualize_autolabeling_results.py --view perspective --annotated-only --combine \
+    --compare-dir /home/lleba/VESPA/outs/vlm/p_final_ecp_all_cameras
+```
+
+**Single scene:**
+```bash
+python visualize_autolabeling_results.py --scene <scene-name> --view perspective --annotated-only
+```
+
+---
+
+### nuScenes Mini — all commands
+
+```bash
+cd /home/lleba/Thesis/Development/Evaluation
+conda activate autolabeling
+```
+
+**BEV, annotated only, per-scene files:**
+```bash
+python visualize_autolabeling_results.py \
+    --data-root /media/lleba/ECP_Nuscenes_01/nuScenes_mini \
+    --version v1.0-mini \
+    --label-json /media/lleba/ECP_Nuscenes_01/autolabeling/output/nuscenes_mini/lidar_integration_objects_o3_body_b1_all_cameras/autolabel_nuscenes_mini_train_8class.json \
+    --annotated-only
+```
+
+**BEV, annotated only, combined:**
+```bash
+python visualize_autolabeling_results.py \
+    --data-root /media/lleba/ECP_Nuscenes_01/nuScenes_mini \
+    --version v1.0-mini \
+    --label-json /media/lleba/ECP_Nuscenes_01/autolabeling/output/nuscenes_mini/lidar_integration_objects_o3_body_b1_all_cameras/autolabel_nuscenes_mini_train_8class.json \
+    --annotated-only --combine
+```
+
+**BEV, annotated only, combined, vs VESPA:**
+```bash
+python visualize_autolabeling_results.py \
+    --data-root /media/lleba/ECP_Nuscenes_01/nuScenes_mini \
+    --version v1.0-mini \
+    --label-json /media/lleba/ECP_Nuscenes_01/autolabeling/output/nuscenes_mini/lidar_integration_objects_o3_body_b1_all_cameras/autolabel_nuscenes_mini_train_8class.json \
+    --annotated-only --combine \
+    --compare-json /home/lleba/VESPA/outs/vlm/p_final_all_cameras/#out_labels/vlm_p_final_all_8class.json
+```
+
+**Perspective, annotated only, per-scene files:**
+```bash
+python visualize_autolabeling_results.py \
+    --data-root /media/lleba/ECP_Nuscenes_01/nuScenes_mini \
+    --version v1.0-mini \
+    --label-json /media/lleba/ECP_Nuscenes_01/autolabeling/output/nuscenes_mini/lidar_integration_objects_o3_body_b1_all_cameras/autolabel_nuscenes_mini_train_8class.json \
+    --view perspective --annotated-only
+```
+
+**Perspective, annotated only, combined:**
+```bash
+python visualize_autolabeling_results.py \
+    --data-root /media/lleba/ECP_Nuscenes_01/nuScenes_mini \
+    --version v1.0-mini \
+    --label-json /media/lleba/ECP_Nuscenes_01/autolabeling/output/nuscenes_mini/lidar_integration_objects_o3_body_b1_all_cameras/autolabel_nuscenes_mini_train_8class.json \
+    --view perspective --annotated-only --combine
+```
+
+**Perspective, annotated only, combined, vs VESPA:**
+```bash
+python visualize_autolabeling_results.py \
+    --data-root /media/lleba/ECP_Nuscenes_01/nuScenes_mini \
+    --version v1.0-mini \
+    --label-json /media/lleba/ECP_Nuscenes_01/autolabeling/output/nuscenes_mini/lidar_integration_objects_o3_body_b1_all_cameras/autolabel_nuscenes_mini_train_8class.json \
+    --view perspective --annotated-only --combine \
+    --compare-json /home/lleba/VESPA/outs/vlm/p_final_all_cameras/#out_labels/vlm_p_final_all_8class.json
+```

@@ -322,6 +322,65 @@ def load_lidar_pts_aggregated(
     return np.concatenate(all_pts, axis=0)
 
 
+def load_sweep_data(
+    nusc, frame, n_before: int, n_after: int,
+    use_ego_body_filter: bool = True,
+    ego_box_half_x: float = 4.0,
+    ego_box_half_y: float = 1.5,
+    ego_box_z_min: float = 0.5,
+    ego_box_z_max: float = 2.5,
+) -> Optional[List[dict]]:
+    """
+    Load per-sweep data for the ICP motion compensation pass.
+
+    Returns the same N_BEFORE/N_AFTER window used by load_lidar_pts_aggregated,
+    but keeps each sweep separate instead of concatenating.
+
+    Parameters
+    ----------
+    nusc               : NuScenes instance
+    frame              : FrameRecord with lidar_sd_token, R_e2g, t_e2g populated
+    n_before / n_after : sweep window (same values as lidar_aggregation config)
+    use_ego_body_filter: apply ego-body box per sweep (in sweep's own ego frame)
+    ego_box_*          : ego-body box parameters
+
+    Returns
+    -------
+    list of dicts in chronological order, each containing:
+        rel_idx     : int    0 = anchor, negative = before, positive = after
+        dt_ms       : float  timestamp offset from anchor [ms]
+        pts_ego_anc : (N, 3) float32  ground-unfiltered points in anchor ego frame
+    None when frame has no LiDAR.
+    """
+    if frame.lidar_sd_token is None:
+        return None
+
+    _filter_kw = dict(
+        use_ego_body_filter=use_ego_body_filter,
+        ego_box_half_x=ego_box_half_x,
+        ego_box_half_y=ego_box_half_y,
+        ego_box_z_min=ego_box_z_min,
+        ego_box_z_max=ego_box_z_max,
+    )
+    sweep_tokens = _walk_lidar_tokens(nusc, frame.lidar_sd_token, n_before, n_after)
+
+    # Anchor timestamp for dt computation
+    anchor_sd  = nusc.get('sample_data', frame.lidar_sd_token)
+    anchor_ts  = anchor_sd['timestamp']
+
+    result = []
+    for rel_idx, tok in sweep_tokens:
+        sd     = nusc.get('sample_data', tok)
+        dt_ms  = (sd['timestamp'] - anchor_ts) / 1_000.0
+        pts    = _load_sweep_ego(nusc, tok, frame.R_e2g, frame.t_e2g, **_filter_kw)
+        result.append(dict(
+            rel_idx     = rel_idx,
+            dt_ms       = dt_ms,
+            pts_ego_anc = pts.astype(np.float32),
+        ))
+    return result
+
+
 def load_lidar_pts(frame) -> Optional[np.ndarray]:
     """
     Load the full LiDAR sweep for a frame into ego frame coordinates.

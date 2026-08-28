@@ -241,7 +241,7 @@ conda activate autolabeling
 python run_pipeline.py \
   --config configs/nuscenes.yaml \
   --split train \
-  --output-dir /home/lleba/Thesis/Development/AutoLabeling/output/nuscenes_mini/lidar_integration_option1
+  --output-dir /media/lleba/ECP_Nuscenes_01/autolabeling/output/nuscenes_mini/lidar_integration_objects_o3_body_b1_all_cameras/
 
 # ecp
 python run_pipeline.py \
@@ -266,4 +266,4 @@ python run_pipeline.py --config configs/ecp.yaml \
 python run_pipeline.py \
   --config configs/ecp.yaml \
   --annotated-only \
-  --output-dir /home/lleba/Thesis/Development/AutoLabeling/output/ecp/lidar_integration_option1
+  --output-dir /media/lleba/ECP_Nuscenes_01/autolabeling/output/ecp/lidar_integration_objects_o5_body_b1_all_cameras/

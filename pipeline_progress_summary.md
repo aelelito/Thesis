@@ -300,10 +300,26 @@ require modifying the internal `CameraEncoder` and re-training (planned as **B2*
 ### B1 — Post-inference LiDAR depth correction (two stages)
 
 **Stage 1 — Depth (tz) correction**:
-1. HDBSCAN on in-mask LiDAR → dominant surface cluster
-2. `tz_lidar = median(Z_vis[in_mask][keep])`
-3. Recompute `tx = (u_cen - cx)/fx * tz_lidar`, `ty = (v_cen - cy)/fy * tz_lidar`
-4. Shift all vertices by `[tx_new - tx_pred, ty_new - ty_pred, tz_lidar - tz_pred]`
+
+Each SAM3D Body result stores `sam3_mask_idx` (direct index into the SAM3 pedestrian
+detection list) and `binary_mask` (the associated SAM3 mask, or `None` for ViTDet-only
+detections).  Stage 1 uses `sam3_mask_idx` for O(1) mask retrieval — no IoU search.
+
+Two paths based on whether the pedestrian is classified as dynamic (ICP result has
+`is_dynamic=True`) or static:
+
+- **Static pedestrian**: aggregated in-mask LiDAR cloud → `filter_inmask_lidar_hdbscan` →
+  dominant cluster → `tz_lidar = median(Z_vis[keep])`
+- **Dynamic pedestrian**: ICP-compensated cloud from `mc_pts_by_mask_id[id(binary_mask)]`
+  → `filter_inmask_lidar_hdbscan` → surviving cluster projected ego→camera frame via
+  `R_c2e.T @ (pts − t_c2e).T` → `tz_lidar = median(Z_cam[:, 2][Z > 0])`
+- **ViTDet-only** (no SAM3 mask, `sam3_mask_idx=None`): rectangular bbox-rect mask built
+  from the ViTDet bbox → same HDBSCAN → same tz derivation; no ICP lookup possible
+
+After tz is determined (any path):
+1. `tz_lidar` = corrected depth
+2. Recompute `tx = (u_cen - cx)/fx * tz_lidar`, `ty = (v_cen - cy)/fy * tz_lidar`
+3. Shift all vertices by `[tx_new - tx_pred, ty_new - ty_pred, tz_lidar - tz_pred]`
 
 Fallback: if HDBSCAN finds no cluster → 15th-percentile of all raw in-mask depths (targets
 front surface while discarding ground bleed at the feet).
@@ -395,10 +411,8 @@ dramatically — the complete depth shape aids heading estimation from elongated
 | VESPA all cameras | 0.1176 | 0.784 | 0.498 | 1.240 | 0.1305 |
 
 **Key comparison**: Front-camera-only — our best (O3+B1) = **0.0222 vs VESPA front = 0.0075**
-(~3× improvement). VESPA's all-camera run (0.1176) still leads overall — multi-view coverage
-is a major advantage on the dense nuScenes scenes, where many vehicles are visible from
-side/rear cameras but not from the front. This gap is a strong motivation for implementing
-multi-camera merging.
+(~3× improvement). With all 6 cameras active, O3+B1 reaches **0.2210 — beating VESPA all-cameras
+(0.1176) by +88%**. Multi-camera coverage closes and reverses the nuScenes gap entirely.
 
 ### 6.5 nuScenes — Why O3 beats O5
 
@@ -483,11 +497,24 @@ This is a lenient sanity check, not a precision tool.
 
 ## 8. Planned Next Steps
 
-### Multi-camera merging
-All evaluations so far use front camera only. Fusing results from all cameras (6 for nuScenes,
-~3 for ECP) would dramatically increase coverage — especially for pedestrians in side views and
-vehicles behind the ego. Requires projecting all camera-frame OBBs into a common ego frame and
-deduplicating overlapping boxes across views. Not yet implemented.
+### Multi-camera merging *(implemented — not yet re-evaluated)*
+The cross-camera duplicate suppression pipeline is implemented in
+`AutoLabeling/src/autolabeling/cross_camera_merge.py`.  It operates in three stages:
+1. **Border check** — detections whose mask touches the image edge adjacent to a neighbouring camera are flagged as candidates
+2. **BEV OBB overlap** — matched greedily by BEV footprint overlap (Shapely polygons); pairs with ≥ 10% overlap are accepted
+3. **Appearance embedding fallback** — ResNet18 cosine similarity pairs any remaining unmatched border candidates
+
+Enabled via `cross_camera_merge: enabled: true` in the per-dataset YAML and active in
+`run_multi_camera_pipeline`.  All current evaluation results in §6 still use front camera only
+(`CAM_FRONT`), so the multi-camera coverage gain has not yet been measured.  The VESPA all-camera
+gap on nuScenes (0.022 vs 0.118) is the primary motivation for running multi-camera evaluation.
+
+### ICP/MC integration for dynamic objects *(implemented — currently hurts performance)*
+Per-object motion compensation is implemented and integrated into the pipeline (Phase 1 tracking + Phase 2 growing-target ICP, static/dynamic classification, downstream routing). However, evaluation shows it currently reduces performance on both datasets:
+- ECP all-cameras: O3+B1 no-agg = 0.2124 vs MC+agg(6) = 0.1666
+- nuScenes front-cam: O3+B1 = 0.0222 vs MC+agg(10) = 0.0136
+
+Root causes: sweep aggregation adds smearing that ICP does not fully compensate; the MC implementation may need tuning for fast-moving nuScenes scenes. Future work: tune MC parameters per dataset, test MC on single-sweep (no aggregation) to isolate the compensation benefit from the aggregation cost.
 
 ### O6 — Improved depth for zero-LiDAR objects (FP reduction)
 The dominant FP source in O5 on nuScenes is zero-LiDAR objects placed at wrong metric depths
@@ -527,8 +554,11 @@ could further constrain OBB scale.
 | O3+agg+filt | Dense (MoGe+aff) | Approx | Ego+range | Per-object | 0.169 | 0.022 |
 | O4+agg+filt | Dense (CFormer) | Yes | PseudoLabeler | — | 0.128 | — |
 | **O5+agg+filt** | Dense (CFormer) | Yes | Ego+range | Per-mask | **0.169** | 0.016 |
+| O3+agg+filt+hull | Dense (MoGe+aff) | Approx | Hull | Per-object | 0.180 | 0.023 |
+| **O5+agg+filt+hull** | Dense (CFormer) | Yes | Hull | Per-mask | **0.187** | 0.016 |
+| O3+B1 (all cams) | Dense (MoGe+aff) | Approx | Ego+range | Per-object | **0.212** | **0.221** |
 | VESPA front cam | — | — | — | — | 0.102 | 0.008 |
 | VESPA all cams | — | — | — | — | 0.122 | 0.118 |
 
-*All our runs: front camera only. VESPA all-cameras uses full camera ring.*
-*agg: multi-sweep aggregation. filt: ego-body + max-range filter.*
+*Front-camera rows: CAM_FRONT only. All-cams row: 3 cameras ECP / 6 cameras nuScenes.*
+*agg: multi-sweep aggregation. filt: ego-body + max-range filter. hull: hull anchoring + updated HDBSCAN.*

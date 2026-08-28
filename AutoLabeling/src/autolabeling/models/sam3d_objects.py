@@ -55,6 +55,8 @@ class SAM3DObjectsModel:
         proximity_min_pts: int = 30,            # O5 proximity selection: min size of largest cluster
         proximity_ratio: float = 0.70,          # O5 proximity selection: second/largest ratio threshold
         hull_anchoring: bool = False,           # O4/O5: post-CFormer convex-hull depth clamp
+        mask_erode_px: int = 0,                 # O3: erode binary mask before HDBSCAN point selection (0 = off)
+        mask_erode_min_px: int = 0,             # O3: min mask area [px] to apply erosion (0 = always)
     ):
         self.repo_path              = str(repo_path)
         self.config_path            = str(config_path)
@@ -70,6 +72,8 @@ class SAM3DObjectsModel:
         self.proximity_min_pts      = proximity_min_pts
         self.proximity_ratio        = proximity_ratio
         self.hull_anchoring         = hull_anchoring
+        self.mask_erode_px          = mask_erode_px
+        self.mask_erode_min_px      = mask_erode_min_px
         self._inference             = None
         self._cformer               = None
 
@@ -340,8 +344,20 @@ class SAM3DObjectsModel:
         u_int = np.round(u_vis).astype(int).clip(0, W - 1)
         v_int = np.round(v_vis).astype(int).clip(0, H - 1)
 
-        # Step 1 — find in-mask LiDAR points
-        in_mask    = binary_mask[v_int, u_int]
+        # Step 1 — find in-mask LiDAR points.
+        # Optionally erode the mask before HDBSCAN point selection to reduce
+        # border bleed-in from adjacent objects.  The un-eroded mask is kept
+        # for affine fit and pointmap reconstruction (only HDBSCAN is affected).
+        if self.mask_erode_px > 0 and int(binary_mask.sum()) >= self.mask_erode_min_px:
+            import cv2 as _cv2o3
+            _er_k = _cv2o3.getStructuringElement(
+                _cv2o3.MORPH_ELLIPSE,
+                (2 * self.mask_erode_px + 1, 2 * self.mask_erode_px + 1))
+            _mask_hdbscan = _cv2o3.erode(
+                binary_mask.astype(np.uint8), _er_k).astype(bool)
+        else:
+            _mask_hdbscan = binary_mask
+        in_mask    = _mask_hdbscan[v_int, u_int]
         pts_inmask = pts_ego_vis[in_mask]
         Z_inmask   = Z_vis[in_mask]
         u_inmask   = u_vis[in_mask]

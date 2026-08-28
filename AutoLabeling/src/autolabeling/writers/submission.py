@@ -109,12 +109,25 @@ def _pedestrian_box(r: dict, R_c2e: np.ndarray, t_c2e: np.ndarray,
     yaw_global = float(np.arctan2(fwd_global[1], fwd_global[0]))
     rotation = _yaw_to_quat(yaw_global)
 
+    # Velocity: rotate ego-frame [vx, vy] to global XY
+    _vel_ego = r.get('velocity_mps', 0.0)
+    if isinstance(_vel_ego, (int, float)) and _vel_ego != 0.0:
+        # scalar speed → use orientation forward as direction
+        _vel_fwd_ego = R_c2e @ fwd_cam * float(_vel_ego)
+        _vel_global  = R_e2g @ _vel_fwd_ego
+        velocity = [float(_vel_global[0]), float(_vel_global[1])]
+    elif isinstance(_vel_ego, (list, tuple, np.ndarray)) and len(_vel_ego) >= 2:
+        _vel_g   = R_e2g @ np.array([float(_vel_ego[0]), float(_vel_ego[1]), 0.0])
+        velocity = [float(_vel_g[0]), float(_vel_g[1])]
+    else:
+        velocity = [0.0, 0.0]
+
     return {
         'sample_token':    sample_token,
         'translation':     center_global.tolist(),
         'size':            size,
         'rotation':        rotation,
-        'velocity':        [0.0, 0.0],
+        'velocity':        velocity,
         'detection_name':  'pedestrian',
         'detection_score': float(r.get('score', 1.0)),
         'attribute_name':  '',
@@ -144,12 +157,22 @@ def _object_box(r: dict, R_e2g: np.ndarray, t_e2g: np.ndarray, sample_token: str
 
     det_name = PROMPT_TO_CLASS.get(r['prompt'], r['prompt'])
 
+    # Velocity: when MC is enabled, r['velocity_mps'] holds object speed in ego frame
+    # along the heading direction; rotate to global XY.
+    _vel_mps = float(r.get('velocity_mps', 0.0))
+    if _vel_mps != 0.0:
+        _vel_ego_vec = fwd_ego * _vel_mps          # [vx, vy, 0] in ego frame
+        _vel_global  = R_e2g @ _vel_ego_vec
+        velocity = [float(_vel_global[0]), float(_vel_global[1])]
+    else:
+        velocity = [0.0, 0.0]
+
     return {
         'sample_token':    sample_token,
         'translation':     center_global.tolist(),
         'size':            size,
         'rotation':        rotation,
-        'velocity':        [0.0, 0.0],
+        'velocity':        velocity,
         'detection_name':  det_name,
         'detection_score': float(r.get('score', 1.0)),
         'attribute_name':  '',
@@ -162,6 +185,7 @@ def build_submission(
     obj_results: Dict[int, list],
     split: str,
     mapping_name: str,
+    config: dict = None,
 ) -> dict:
     """
     Assemble the full submission dict from per-frame pipeline results.
@@ -192,12 +216,68 @@ def build_submission(
 
         results[token] = boxes
 
-    return {
+    out = {
         'split':        split,
         'mapping_name': mapping_name,
         'meta':         _META,
         'results':      results,
     }
+    if config is not None:
+        out['config'] = config
+    return out
+
+
+def build_submission_multi_cam(
+    frames_per_cam: Dict[str, list],
+    body_results_all: Dict[str, Dict[int, list]],
+    obj_results_all:  Dict[str, Dict[int, list]],
+    split: str,
+    mapping_name: str,
+    config: dict = None,
+) -> dict:
+    """
+    Assemble a submission dict from multi-camera pipeline results.
+
+    All cameras share the same sample_token for the same keyframe index i.
+    Detections from every camera are combined into the same per-token box list.
+
+    Parameters
+    ----------
+    frames_per_cam   : {cam: [FrameRecord]}  — same length for every camera
+    body_results_all : {cam: {frame_list_idx: [body result dicts]}}
+    obj_results_all  : {cam: {frame_list_idx: [obj  result dicts]}}
+    split            : "train" or "val"
+    mapping_name     : "8class" / "3class" / "1class"
+
+    Returns
+    -------
+    submission dict ready for json.dump
+    """
+    cams     = list(frames_per_cam.keys())
+    n_frames = len(frames_per_cam[cams[0]])
+    results  = {}
+
+    for i in range(n_frames):
+        token = frames_per_cam[cams[0]][i].sample_token  # same for all cameras
+        boxes = []
+        for cam in cams:
+            frame = frames_per_cam[cam][i]
+            for r in body_results_all.get(cam, {}).get(i, []):
+                boxes.append(_pedestrian_box(r, frame.R_c2e, frame.t_c2e,
+                                             frame.R_e2g, frame.t_e2g, token))
+            for r in obj_results_all.get(cam, {}).get(i, []):
+                boxes.append(_object_box(r, frame.R_e2g, frame.t_e2g, token))
+        results[token] = boxes
+
+    out = {
+        'split':        split,
+        'mapping_name': mapping_name,
+        'meta':         _META,
+        'results':      results,
+    }
+    if config is not None:
+        out['config'] = config
+    return out
 
 
 def remap_submission(submission_8class: dict, target_mapping: str) -> dict:

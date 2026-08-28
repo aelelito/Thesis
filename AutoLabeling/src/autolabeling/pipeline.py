@@ -24,11 +24,19 @@ Checkpoint layout
 Stage order
 -----------
 1. SAM3 segmentation           (all frames, GPU)
-2. SAM3D Body + B1 correction  (all frames, GPU + CPU)
-   - Stage 1: LiDAR tz correction (HDBSCAN per pedestrian)
+2. PseudoLabeler pre-fitting   (all frames, CPU — only when B2 or O4 active)
+3. ICP motion compensation     (all frames, GPU for TerraSeg + CPU for ICP)
+   - TerraSeg-S ground removal per sweep
+   - Phase 1: HDBSCAN centroid tracking outward from anchor
+   - Phase 2: SE(2) ICP with growing target, alternating fwd/bwd sweep order
+   - Classifies each object as dynamic/static; estimates velocity + heading
+4. SAM3D Body + B1 correction  (all frames, GPU + CPU)
+   - Stage 1: LiDAR tz correction (HDBSCAN or MC point cloud per pedestrian)
    - Stage 2: Ground anchoring (PseudoLabeler MLP fitted per frame)
-3. SAM3D Objects + MoGe        (all frames, GPU)
-4. Orientation + OBB           (CPU, per frame)
+5. SAM3D Objects + MoGe        (all frames, GPU)
+6. Orientation + OBB           (CPU, per frame)
+   - Dynamic objects: heading from ICP trajectory (no 180° ambiguity)
+   - Static objects:  PCA yaw disambiguated toward ego heading (road-aligned)
 """
 import gzip
 import zlib
@@ -44,16 +52,22 @@ import torch
 from sklearn.linear_model import RANSACRegressor
 from tqdm import tqdm
 
-from .fitting.obb import compute_obb_gravity_aligned, compute_obb_pedestrian
+from .fitting.obb import compute_obb_gravity_aligned, compute_obb_pedestrian, disambiguate_yaw
 from .models.sam3_segmentor import SAM3Segmentor
 from .models.sam3d_body import SAM3DBodyModel
 from .models.sam3d_objects import SAM3DObjectsModel
+from .motion_compensation import (
+    TerraSegGroundFilter,
+    compensate_object_motion,
+    flatten_sam3_masks,
+)
 from .orientation.pedestrian import facing_direction
 from .utils.lidar import (
     filter_inmask_lidar_hdbscan,
     filter_lidar_pts,
     load_lidar_pts,
     load_lidar_pts_aggregated,
+    load_sweep_data,
     project_lidar_to_camera,
 )
 
@@ -258,54 +272,80 @@ def _restore_pseudolabeler(state_dict: Optional[dict], device: str, dev_root: Pa
 
 # ── B1 — depth correction helpers ────────────────────────────────────────────
 
-def _best_sam3_mask(bbox, ped_dets,
-                    iou_thresh: float = 0.3) -> Optional[np.ndarray]:
-    """Return highest-IoU SAM3 mask for bbox, or None if below threshold."""
-    x1, y1, x2, y2 = bbox
-    best_mask, best_iou = None, iou_thresh
-    for d in ped_dets:
-        ys, xs = np.where(d['binary_mask'])
-        if len(xs) == 0:
-            continue
-        mx1, my1 = float(xs.min()), float(ys.min())
-        mx2, my2 = float(xs.max()), float(ys.max())
-        inter = max(0., min(x2, mx2) - max(x1, mx1)) * max(0., min(y2, my2) - max(y1, my1))
-        iou   = inter / ((x2-x1)*(y2-y1) + (mx2-mx1)*(my2-my1) - inter + 1e-8)
-        if iou > best_iou:
-            best_iou, best_mask = iou, d['binary_mask']
-    return best_mask
-
 
 def _apply_b1_depth_correction(body_results: list, frame, ped_dets: list,
                                 pts_ego_vis, u_vis, v_vis, Z_vis,
                                 H: int, W: int,
-                                hdbscan_kwargs: dict = None) -> None:
+                                hdbscan_kwargs: dict = None,
+                                mc_pts_by_mask_id: Optional[dict] = None) -> None:
     """
     Stage 1: override tz for each pedestrian with HDBSCAN-filtered median LiDAR depth.
     Recomputes tx, ty from mask centroid. Shifts vertices by delta; cam_t updated.
     joints_3d are body-relative and are NOT shifted.
     Modifies body_results in-place.
+
+    mc_pts_by_mask_id : optional dict mapping id(binary_mask) → (N,3) ego-frame
+        ICP-compensated point cloud for dynamic pedestrians.  When present, the
+        ICP cloud is used for tz estimation (HDBSCAN → median) instead of the
+        full aggregated sweep.  Static pedestrians always use the standard path.
     """
     fx, fy, cx, cy = frame.K[0, 0], frame.K[1, 1], frame.K[0, 2], frame.K[1, 2]
     u_int = np.round(u_vis).astype(int).clip(0, W - 1)
     v_int = np.round(v_vis).astype(int).clip(0, H - 1)
 
     for i, r in enumerate(body_results):
-        bbox = r.get('bbox')
-        mask = _best_sam3_mask(bbox, ped_dets) if bbox is not None else None
-
-        if mask is None:
-            if bbox is not None:
-                x1, y1, x2, y2 = [int(v) for v in bbox]
-                mask = np.zeros((H, W), dtype=bool)
-                mask[max(0, y1):min(H, y2+1), max(0, x1):min(W, x2+1)] = True
-                mask_src = 'bbox_rect'
-            else:
+        # ── Resolve mask: use sam3_mask_idx for direct association ───────────
+        # sam3_mask_idx is set by SAM3DBodyModel.run_frame for SAM3-sourced boxes
+        # (None for ViTDet-only detections that have no corresponding SAM3 mask).
+        sam3_mask_idx = r.get('sam3_mask_idx')
+        if sam3_mask_idx is not None and sam3_mask_idx < len(ped_dets):
+            mask     = ped_dets[sam3_mask_idx]['binary_mask']
+            mask_src = 'sam3_mask'
+        else:
+            # ViTDet-only: fall back to bbox rect
+            bbox = r.get('bbox')
+            if bbox is None:
                 r['b1_mode'] = 'no_bbox'
                 continue
-        else:
-            mask_src = 'sam3_mask'
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            mask = np.zeros((H, W), dtype=bool)
+            mask[max(0, y1):min(H, y2+1), max(0, x1):min(W, x2+1)] = True
+            mask_src = 'bbox_rect'
 
+        tz_pred = float(r['cam_t'][2])
+
+        # ── MC path: dynamic pedestrians use ICP-compensated cloud ───────────
+        # Only dynamic pedestrians are in mc_pts_by_mask_id; static ones take
+        # the standard aggregated-sweep HDBSCAN path below.
+        if (sam3_mask_idx is not None
+                and mc_pts_by_mask_id is not None
+                and sam3_mask_idx < len(ped_dets)
+                and id(ped_dets[sam3_mask_idx]['binary_mask']) in mc_pts_by_mask_id):
+            mc_pts = mc_pts_by_mask_id[id(ped_dets[sam3_mask_idx]['binary_mask'])]
+            if len(mc_pts) >= 2:
+                # Run HDBSCAN on the ICP cloud to get the dominant cluster
+                _keep_mc = filter_inmask_lidar_hdbscan(mc_pts, **(hdbscan_kwargs or {}))
+                mc_pts_use = mc_pts[_keep_mc] if _keep_mc is not None else mc_pts
+                # Project ego-frame cloud into camera
+                pts_cam = (frame.R_c2e.T @ (mc_pts_use.astype(np.float64) - frame.t_c2e).T).T
+                Z_mc    = pts_cam[:, 2]
+                Z_mc    = Z_mc[Z_mc > 0]
+                if len(Z_mc) > 0:
+                    tz_lidar  = float(np.median(Z_mc))
+                    ys, xs    = np.where(mask)
+                    u_cen     = float(xs.mean())
+                    v_cen     = float(ys.mean())
+                    tx_new    = (u_cen - cx) / fx * tz_lidar
+                    ty_new    = (v_cen - cy) / fy * tz_lidar
+                    cam_t_new     = np.array([tx_new, ty_new, tz_lidar], dtype=np.float32)
+                    delta         = cam_t_new - r['cam_t']
+                    r['vertices'] = r['vertices'] + delta[None, :]
+                    r['cam_t']    = cam_t_new
+                    r['b1_mode']  = f'{mask_src}+mc_icp'
+                    print(f'    [B1-tz ] ped {i}: {tz_pred:.2f}→{tz_lidar:.2f} m  [{mask_src}+mc_icp]')
+                    continue
+
+        # ── Standard path: full sweep in-mask HDBSCAN ────────────────────────
         in_mask    = mask[v_int, u_int]
         pts_inmask = pts_ego_vis[in_mask]
         Z_inmask   = Z_vis[in_mask]
@@ -314,8 +354,7 @@ def _apply_b1_depth_correction(body_results: list, frame, ped_dets: list,
             r['b1_mode'] = 'no_lidar'
             continue
 
-        keep    = filter_inmask_lidar_hdbscan(pts_inmask, **(hdbscan_kwargs or {}))
-        tz_pred = float(r['cam_t'][2])
+        keep = filter_inmask_lidar_hdbscan(pts_inmask, **(hdbscan_kwargs or {}))
 
         if keep is None:
             tz_lidar = float(np.percentile(Z_inmask, 15))
@@ -410,8 +449,22 @@ def _apply_b2_ground_anchoring(body_results: list, frame,
 
 # ── Postprocess (CPU) ─────────────────────────────────────────────────────────
 
-def _postprocess_frame(frame, body: list, objs: list) -> None:
-    """Orientation estimation + OBB fitting for one frame. Modifies lists in-place."""
+def _postprocess_frame(frame, body: list, objs: list,
+                       mc_lookup: Optional[dict] = None) -> None:
+    """
+    Orientation estimation + OBB fitting for one frame. Modifies lists in-place.
+
+    mc_lookup : optional dict mapping id(binary_mask) → MC result dict.
+        When provided:
+          - Dynamic objects use ICP trajectory heading (resolves 180° ambiguity).
+          - Static objects use PCA yaw disambiguated toward ego heading
+            (parked vehicles are road-aligned → closest to ego travel direction).
+          - velocity_mps and is_dynamic fields are added to every result.
+    """
+    # Ego heading from R_e2g: forward axis [1,0,0] rotated to global XY
+    ego_fwd   = frame.R_e2g @ np.array([1.0, 0.0, 0.0])
+    ego_heading_rad = float(np.arctan2(ego_fwd[1], ego_fwd[0]))
+
     for r in body:
         fwd = facing_direction(r['joints_3d'])
         r['orientation_fwd'] = fwd
@@ -420,6 +473,11 @@ def _postprocess_frame(frame, body: list, objs: list) -> None:
         r['obb_center']  = center   # camera space
         r['obb_dims']    = dims
         r['obb_yaw']     = float(np.arctan2(fwd[0], fwd[2]))
+        # Velocity/dynamic from MC: body results carry _mc_mask_id when MC is enabled
+        # (attached in the SAM3D Body loop below); otherwise defaults to 0 / False.
+        _mc = (mc_lookup or {}).get(r.get('_mc_mask_id'))
+        r['velocity_mps'] = float(_mc['velocity_mps']) if _mc else 0.0
+        r['is_dynamic']   = bool(_mc['is_dynamic'])    if _mc else False
 
     for r in objs:
         r['orientation_fwd'] = None
@@ -429,7 +487,27 @@ def _postprocess_frame(frame, body: list, objs: list) -> None:
         r['obb_corners'] = corners
         r['obb_center']  = center   # ego space
         r['obb_dims']    = dims
-        r['obb_yaw']     = yaw
+
+        # MC lookup: SAM3D Objects result dicts carry 'binary_mask' from the detection.
+        _mc = (mc_lookup or {}).get(id(r.get('binary_mask'))) if mc_lookup else None
+        if _mc is not None:
+            r['velocity_mps'] = float(_mc['velocity_mps'])
+            r['is_dynamic']   = bool(_mc['is_dynamic'])
+            heading = _mc.get('heading_rad', float('nan'))
+            if _mc['is_dynamic'] and not np.isnan(heading):
+                # Dynamic: ICP trajectory heading resolves 180° ambiguity definitively
+                r['obb_yaw'] = float(heading)
+            else:
+                # Static (or no valid heading): disambiguate PCA yaw toward ego heading.
+                # disambiguate_yaw is independent of ICP — it only needs ego heading —
+                # so we apply it here (MC enabled path) and also in the else branch below.
+                r['obb_yaw'] = disambiguate_yaw(yaw, ego_heading_rad)
+        else:
+            r['velocity_mps'] = 0.0
+            r['is_dynamic']   = False
+            # Always disambiguate PCA yaw regardless of MC: 180° ambiguity is a
+            # property of PCA, not of ICP. Ego heading is always available.
+            r['obb_yaw']      = disambiguate_yaw(yaw, ego_heading_rad)
 
 
 # ── Rider OBB merge ───────────────────────────────────────────────────────────
@@ -505,6 +583,80 @@ def _merge_rider_obbs(
     return new_body, obj_list
 
 
+# ── OBB size / volume filter ──────────────────────────────────────────────────
+
+def _apply_obb_filter(body_list: list, obj_list: list,
+                      min_volume: dict, max_volume: dict) -> tuple:
+    """
+    Discard OBBs whose volume is outside the per-class [min, max] range.
+
+    Volume = dim[0] × dim[1] × dim[2].
+    Body (pedestrian) OBB dims are camera-space [W, H, D].
+    Object OBB dims are ego-space [L, W, H] (PCA long-axis first).
+
+    Returns (kept_body, kept_obj, n_dropped_body, n_dropped_obj).
+    """
+    def _vol_ok(dims, label):
+        vol = float(dims[0]) * float(dims[1]) * float(dims[2])
+        mn = min_volume.get(label)
+        mx = max_volume.get(label)
+        if mn is not None and vol < mn:
+            return False
+        if mx is not None and vol > mx:
+            return False
+        return True
+
+    kept_body = [r for r in body_list if _vol_ok(r['obb_dims'], 'pedestrian')]
+    kept_obj  = [r for r in obj_list  if _vol_ok(r['obb_dims'], r.get('prompt', ''))]
+    return kept_body, kept_obj, len(body_list) - len(kept_body), len(obj_list) - len(kept_obj)
+
+
+def _apply_ego_obb_excl_filter(frames: list, body_results: dict, obj_results: dict,
+                                ego_obb_depth: dict, default_depth: float) -> tuple:
+    """
+    Drop OBBs whose center falls within EGO_OBB_DEPTH metres of the camera
+    along its optical axis (catches ego-vehicle artefacts, e.g. hood as 'car').
+
+    Depth is per-camera from ego_obb_depth dict; default_depth used as fallback.
+    Body OBB centers are in camera space and are transformed to ego before the check.
+    Object OBB centers are already in ego space.
+
+    Returns (new_body_results, new_obj_results, n_dropped_body, n_dropped_obj).
+    """
+    new_body, new_obj = {}, {}
+    total_drop_b, total_drop_o = 0, 0
+
+    for i, frame in enumerate(frames):
+        R, t = frame.R_c2e, frame.t_c2e
+        fwd_ego = R @ np.array([0., 0., 1.])           # camera optical axis in ego frame
+        D = float(ego_obb_depth.get(frame.camera_name, default_depth))
+
+        def _excl(center_ego):
+            d = float(np.dot(np.array(center_ego, dtype=np.float64) - t, fwd_ego))
+            return 0.0 <= d <= D
+
+        kept_body = []
+        for r in body_results[i]:
+            cen_ego = R @ np.array(r['obb_center'], dtype=np.float64) + t
+            if _excl(cen_ego):
+                total_drop_b += 1
+            else:
+                kept_body.append(r)
+
+        kept_obj = []
+        for r in obj_results[i]:
+            cen_ego = np.array(r['obb_center'], dtype=np.float64)
+            if _excl(cen_ego):
+                total_drop_o += 1
+            else:
+                kept_obj.append(r)
+
+        new_body[i] = kept_body
+        new_obj[i]  = kept_obj
+
+    return new_body, new_obj, total_drop_b, total_drop_o
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def run_pipeline(
@@ -550,6 +702,18 @@ def run_pipeline(
         print('  [warn] lidar_aggregation.use_aggregation=true but nusc=None — '
               'falling back to single-sweep loading.')
         _use_agg = False
+
+    # ── Motion compensation config ────────────────────────────────────────────
+    _mc_cfg              = getattr(cfg, 'motion_compensation', None)
+    _mc_enabled          = bool(getattr(_mc_cfg, 'enabled',          False)) if _mc_cfg else False
+    _mc_z_ground_min     = float(getattr(_mc_cfg, 'z_ground_min',    0.15))  if _mc_cfg else 0.15
+    _mc_turning_yaw_rate = float(getattr(_mc_cfg, 'turning_yaw_rate', 5.0))  if _mc_cfg else 5.0
+    _mc_icp_max_corresp  = float(getattr(_mc_cfg, 'icp_max_corresp', 0.4))   if _mc_cfg else 0.4
+    _mc_terraseg_ckpt    = getattr(_mc_cfg, 'terraseg_ckpt', None)           if _mc_cfg else None
+    if _mc_enabled and (not _use_agg or nusc is None):
+        print('  [warn] motion_compensation requires lidar_aggregation.use_aggregation=true '
+              'and nusc != None — disabling MC.')
+        _mc_enabled = False
 
     # ── LiDAR point cloud pre-filters ─────────────────────────────────────────
     _flt_cfg            = getattr(cfg, 'lidar_filters', None)
@@ -601,6 +765,8 @@ def run_pipeline(
     _proximity_min_pts   = int(float(getattr(_lidar_cfg_pre, 'proximity_min_pts', 30)))
     _proximity_ratio     = float(getattr(_lidar_cfg_pre, 'proximity_ratio', 0.70))
     _hull_anchoring      = bool(getattr(_lidar_cfg_pre, 'hull_anchoring', False))
+    _mask_erode_px       = int(float(getattr(_lidar_cfg_pre, 'mask_erode_px',     0)))
+    _mask_erode_min_px   = int(float(getattr(_lidar_cfg_pre, 'mask_erode_min_px', 0)))
     # PseudoLabeler is needed when B2 ground anchoring is active OR when O4 uses
     # ground filtering before CompletionFormer sparse anchors.
     # O5 does NOT need PseudoLabeler — per-mask HDBSCAN handles ground clutter implicitly.
@@ -673,6 +839,15 @@ def run_pipeline(
     if _needs_pseudolabeler:
         print('\n[PseudoLabeler ground estimation]')
 
+        # SAM3 loading leaves BF16 autocast globally enabled.  Pre-fitting runs
+        # before the body model's load(), which normally disables it via the same
+        # guard.  Training PseudoLabeler in BF16 causes weight saturation (±2.7
+        # vs expected ±0.1–0.5), producing z_ground predictions of 100,000+ m
+        # instead of ≈–0.8 m and completely wrong pedestrian positions.
+        if torch.is_autocast_enabled():
+            torch.autocast('cuda', enabled=False).__enter__()
+            print('  Disabled inherited BF16 autocast.')
+
         # ── PseudoLabeler checkpoint ──────────────────────────────────────────
         # If a cache file exists for this run and covers all frames, skip refitting.
         # Delete <checkpoint_dir>/pl_states_cache.pt to force a refit.
@@ -733,6 +908,87 @@ def run_pipeline(
 
     _print_gpu(device)
 
+    # ── ICP motion compensation ───────────────────────────────────────────────
+    # mc_results[i] maps  id(binary_mask) → MC result dict for every mask in frame i.
+    # When _mc_enabled=False this stays as an empty-dict mapping (no-op downstream).
+    mc_results: Dict[int, dict] = {i: {} for i in range(len(frames))}
+
+    if _mc_enabled:
+        print('\n[ICP motion compensation]')
+        _ts_filter = None
+        try:
+            _ts_filter = TerraSegGroundFilter(dev_root, ckpt_path=_mc_terraseg_ckpt)
+        except Exception as _e:
+            print(f'  [warn] TerraSeg failed to load ({_e}) — using Z-threshold fallback.')
+
+        from PIL import Image as _PIL_mc
+        bar = tqdm(range(len(frames)), desc='Motion Comp.', unit='frame')
+        for i in bar:
+            frame = frames[i]
+            bar.set_postfix_str(f'{frame.scene_name}  frame {frame.frame_idx}')
+
+            if frame.lidar_sd_token is None:
+                continue
+
+            sweep_data = load_sweep_data(
+                nusc, frame, _n_before, _n_after,
+                use_ego_body_filter=_use_ego_filter,
+                ego_box_half_x=_ego_box_half_x,
+                ego_box_half_y=_ego_box_half_y,
+                ego_box_z_min=_ego_box_z_min,
+                ego_box_z_max=_ego_box_z_max,
+            )
+            if not sweep_data:
+                continue
+
+            # Ground removal per sweep
+            if _ts_filter is not None:
+                sweep_nonground = [
+                    s['pts_ego_anc'][_ts_filter.segment(s['pts_ego_anc'])]
+                    for s in sweep_data
+                ]
+            else:
+                sweep_nonground = [
+                    s['pts_ego_anc'][s['pts_ego_anc'][:, 2] > _mc_z_ground_min]
+                    for s in sweep_data
+                ]
+
+            frame_sam3 = _get_sam3(i, sam3_mem, checkpoint_dir)
+            flat_masks = flatten_sam3_masks(frame_sam3)
+            if not flat_masks:
+                continue
+
+            with _PIL_mc.open(frame.img_path) as _im:
+                _W_mc, _H_mc = _im.size
+
+            mc_list = compensate_object_motion(
+                sweep_data       = sweep_data,
+                sweep_nonground_pts = sweep_nonground,
+                masks            = flat_masks,
+                K                = frame.K,
+                R_c2e            = frame.R_c2e,
+                t_c2e            = frame.t_c2e,
+                H                = _H_mc,
+                W                = _W_mc,
+                hdbscan_params   = hdbscan_params,
+                use_icp          = True,
+                mask_erode_px    = _mask_erode_px,
+                turning_yaw_rate_deg_s = _mc_turning_yaw_rate,
+                icp_max_corresp  = _mc_icp_max_corresp,
+                verbose          = True,
+            )
+
+            mc_results[i] = {
+                id(flat_masks[r['mask_idx']]['binary_mask']): r
+                for r in mc_list
+            }
+
+        if _ts_filter is not None:
+            _ts_filter.unload()
+        print(f'  Done. {len(frames)} frame(s) processed.')
+
+    _print_gpu(device)
+
     # ── SAM3D Body ────────────────────────────────────────────────────────────
     print(f'\n[SAM3D Body — {_body_mode_label}]')
     body_results = {}
@@ -772,6 +1028,18 @@ def run_pipeline(
             ped_dets   = frame_sam3.get('pedestrian', [])
             result     = body_model.run_frame(frame, ped_dets)
 
+            # ── Attach MC mask id so _postprocess_frame can look up velocity ──
+            # Use sam3_mask_idx (stored by SAM3DBodyModel.run_frame) for direct
+            # association — no IoU search needed.  ViTDet-only results have
+            # sam3_mask_idx=None and will not carry an MC velocity.
+            if _mc_enabled and result and mc_results.get(i):
+                for _br in result:
+                    _sidx = _br.get('sam3_mask_idx')
+                    if _sidx is not None and _sidx < len(ped_dets):
+                        _br['_mc_mask_id'] = id(ped_dets[_sidx]['binary_mask'])
+                    else:
+                        _br['_mc_mask_id'] = None
+
             # ── B1: depth correction + ground anchoring ───────────────────────
             if _b1_enabled and result and frame.lidar_path is not None:
                 pts_ego = _load_pts_ego(frame)
@@ -779,10 +1047,22 @@ def run_pipeline(
                     pts_ego_vis, u_vis, v_vis, Z_vis, H, W = project_lidar_to_camera(
                         frame, pts_ego
                     )
+                    # Build MC lookup: dynamic pedestrians only.
+                    # id(binary_mask) → (N,3) ICP-compensated ego-frame cloud.
+                    # Static pedestrians use the standard aggregated-sweep path.
+                    _mc_ped_lookup = None
+                    if _mc_enabled and mc_results.get(i):
+                        _mc_ped_lookup = {
+                            mask_id: mc_r['pts_comp_all']
+                            for mask_id, mc_r in mc_results[i].items()
+                            if mc_r.get('is_dynamic') and mc_r.get('prompt') == 'pedestrian'
+                            and len(mc_r.get('pts_comp_all', [])) > 0
+                        }
                     _apply_b1_depth_correction(
                         result, frame, ped_dets,
                         pts_ego_vis, u_vis, v_vis, Z_vis, H, W,
                         hdbscan_kwargs=hdbscan_params.get('pedestrian'),
+                        mc_pts_by_mask_id=_mc_ped_lookup or None,
                     )
                     if _b2_enabled:
                         # Reconstruct PseudoLabeler from pre-fitted state_dict
@@ -859,6 +1139,8 @@ def run_pipeline(
             proximity_min_pts=_proximity_min_pts,
             proximity_ratio=_proximity_ratio,
             hull_anchoring=_hull_anchoring,
+            mask_erode_px=_mask_erode_px,
+            mask_erode_min_px=_mask_erode_min_px,
         )
         obj_model.load()
         bar = tqdm(pending, total=len(frames), initial=len(frames) - len(pending),
@@ -883,13 +1165,90 @@ def run_pipeline(
     # ── Orientation + OBB (CPU) ───────────────────────────────────────────────
     print('\nOrientation estimation + OBB fitting...')
     for i, frame in enumerate(frames):
-        _postprocess_frame(frame, body_results[i], obj_results[i])
+        _postprocess_frame(frame, body_results[i], obj_results[i],
+                           mc_lookup=mc_results.get(i))
         body_results[i], obj_results[i] = _merge_rider_obbs(
             frame, body_results[i], obj_results[i]
         )
     print('  Done.')
 
+    # ── OBB ego-body exclusion + volume filters ────────────────────────────────
+    _obb_cfg     = getattr(cfg, 'obb_filter', None)
+    _obb_enabled = bool(getattr(_obb_cfg, 'enabled', True)) if _obb_cfg else False
+    if _obb_cfg is not None and _obb_enabled:
+        _ego_depth = vars(getattr(_obb_cfg, 'ego_obb_depth', None) or {})
+        _ego_depth_default = float(getattr(_obb_cfg, 'ego_obb_depth_default', 1.0))
+        if _ego_depth or _ego_depth_default:
+            body_results, obj_results, _db, _do = _apply_ego_obb_excl_filter(
+                frames, body_results, obj_results, _ego_depth, _ego_depth_default)
+            print(f'OBB ego-excl filter: dropped {_db} body, {_do} object(s).')
+
+        _min_vol = vars(getattr(_obb_cfg, 'min_volume', None) or {})
+        _max_vol = vars(getattr(_obb_cfg, 'max_volume', None) or {})
+        total_drop_b, total_drop_o = 0, 0
+        for i in range(len(frames)):
+            body_results[i], obj_results[i], _db, _do = _apply_obb_filter(
+                body_results[i], obj_results[i], _min_vol, _max_vol)
+            total_drop_b += _db
+            total_drop_o += _do
+        print(f'OBB volume filter: dropped {total_drop_b} body, {total_drop_o} object(s).')
+    else:
+        print('OBB filters: disabled.')
+
     return body_results, obj_results
+
+
+def run_multi_camera_pipeline(
+    cfg,
+    frames_per_cam: dict,
+    device: Optional[str] = None,
+    checkpoint_dir: Optional[Path] = None,
+    nusc=None,
+) -> tuple:
+    """
+    Run the full pipeline for every camera in frames_per_cam, then apply
+    cross-camera duplicate suppression.
+
+    Parameters
+    ----------
+    cfg            : config namespace
+    frames_per_cam : {camera_name: [FrameRecord]}  — same keyframe ordering
+    device         : override device; defaults to 'cuda' if available
+    checkpoint_dir : base dir for per-frame checkpoints; camera-specific
+                     sub-directories are created automatically (<dir>/<cam>/)
+    nusc           : NuScenes instance (required when lidar_aggregation enabled)
+
+    Returns
+    -------
+    body_results_all : {cam: {frame_list_idx: [body dicts]}}
+    obj_results_all  : {cam: {frame_list_idx: [obj  dicts]}}
+    """
+    body_results_all: Dict[str, dict] = {}
+    obj_results_all:  Dict[str, dict] = {}
+
+    for cam, frames in frames_per_cam.items():
+        print(f'\n{"=" * 60}')
+        print(f'Camera: {cam}  ({len(frames)} frame(s))')
+        print(f'{"=" * 60}')
+        cam_ckpt = (checkpoint_dir / cam) if checkpoint_dir else None
+        body_r, obj_r = run_pipeline(
+            cfg, frames, device=device, checkpoint_dir=cam_ckpt, nusc=nusc,
+        )
+        body_results_all[cam] = body_r
+        obj_results_all[cam]  = obj_r
+
+    # Cross-camera duplicate suppression
+    _xc_cfg = getattr(cfg, 'cross_camera_merge', None)
+    if _xc_cfg and getattr(_xc_cfg, 'enabled', False):
+        print('\n[Cross-camera merge]')
+        from .cross_camera_merge import cross_camera_merge
+        body_results_all, obj_results_all = cross_camera_merge(
+            body_results_all, obj_results_all, frames_per_cam, _xc_cfg,
+        )
+    else:
+        print('\nCross-camera merge: disabled — skipped.')
+
+    return body_results_all, obj_results_all
 
 
 def _print_gpu(device: str) -> None:

@@ -47,6 +47,9 @@ class FrameRecord:
     t_e2g: np.ndarray          # (3,)   float64  translation ego → global
     scene_name: str
     frame_idx: int             # keyframe index within scene (0-based)
+    camera_name: str = 'CAM_FRONT'  # camera channel name (e.g. 'CAM_FRONT')
+    img_width: int = 0               # image width in pixels (from sensor calibration)
+    img_height: int = 0              # image height in pixels (from sensor calibration)
     # LiDAR fields — None when the dataset has no LIDAR_TOP channel
     lidar_path: Optional[str] = None
     R_l2e: Optional[np.ndarray] = None      # (3, 3) float64  rotation LiDAR → ego
@@ -66,6 +69,8 @@ def _load_frame(nusc: NuScenes, sample_token: str, camera: str, frame_idx: int) 
     sd       = nusc.get('sample_data', sd_token)
     cal      = nusc.get('calibrated_sensor', sd['calibrated_sensor_token'])
     scene    = nusc.get('scene', sample['scene_token'])
+    img_w    = int(sd.get('width',  0))
+    img_h    = int(sd.get('height', 0))
 
     ego_pose = nusc.get('ego_pose', sd['ego_pose_token'])
 
@@ -98,6 +103,9 @@ def _load_frame(nusc: NuScenes, sample_token: str, camera: str, frame_idx: int) 
         t_e2g=t_e2g,
         scene_name=scene['name'],
         frame_idx=frame_idx,
+        camera_name=camera,
+        img_width=img_w,
+        img_height=img_h,
         lidar_path=lidar_path,
         R_l2e=R_l2e,
         t_l2e=t_l2e,
@@ -169,3 +177,26 @@ def collect_frames(
         frames.extend(scene_frames)
 
     return frames
+
+
+def collect_frames_multi_cam(
+    nusc: NuScenes,
+    scene_names: Optional[List[str]],
+    cameras: List[str],
+    frame_start: int = 0,
+    frame_end: Optional[int] = None,
+) -> dict:
+    """
+    Collect FrameRecords for multiple cameras.
+
+    Returns
+    -------
+    {camera_name: [FrameRecord, ...]}  — same frame ordering for every camera.
+    All cameras have identical length; frames_per_cam[cam_A][i] and
+    frames_per_cam[cam_B][i] correspond to the same nuScenes keyframe.
+    """
+    frames_per_cam = {}
+    for cam in cameras:
+        print(f'Collecting frames for {cam}...')
+        frames_per_cam[cam] = collect_frames(nusc, scene_names, cam, frame_start, frame_end)
+    return frames_per_cam
