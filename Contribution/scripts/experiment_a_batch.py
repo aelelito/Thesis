@@ -23,11 +23,11 @@ import pandas as pd
 warnings.filterwarnings('ignore')
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-ECP_DATA_ROOT      = '/media/lleba/ECP_Nuscenes_01/output2/ecp2nuscenes'
-NUSCENES_DATA_ROOT = '/media/lleba/ECP_Nuscenes_01/nuScenes_mini'
-PRED_DIR_ECP       = ('/media/lleba/ECP_Nuscenes_01/autolabeling/output'
+ECP_DATA_ROOT      = '/media/leander/ECP_Nuscenes_01/output2/ecp2nuscenes'
+NUSCENES_DATA_ROOT = '/media/leander/ECP_Nuscenes_01/nuScenes_mini'
+PRED_DIR_ECP       = ('/media/leander/ECP_Nuscenes_01/autolabeling/output'
                       '/ecp/lidar_integration_objects_o3_body_b1_all_cameras')
-PRED_DIR_NUSCENES  = ('/media/lleba/ECP_Nuscenes_01/autolabeling/output'
+PRED_DIR_NUSCENES  = ('/media/leander/ECP_Nuscenes_01/autolabeling/output'
                       '/nuscenes_mini/lidar_integration_objects_o3_body_b1_all_cameras')
 OUT_DIR = os.path.join(os.path.dirname(__file__), '..', 'results')
 

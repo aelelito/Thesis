@@ -2,7 +2,7 @@
 
 **Date completed:** 2026-08-27  
 **Datasets:** ECP→nuScenes (v1.0-trainval, scenes 10/11/15, 33 annotated frames) · nuScenes mini (v1.0-mini, 323 frames)  
-**Predictions:** O5+B1+hull+agg(2)+filt pipeline output (best mAP config: ECP 8-class mAP 0.1866)  
+**Predictions:** O3+B1 pipeline output, run on all cameras (best mAP config: ECP 8-class mAP 0.1866)  
 **Notebook:** `Contribution/notebooks/phase0_freespace.ipynb`  
 **Batch script:** `Contribution/scripts/experiment_a_batch.py`  
 **Raw CSVs:** `Contribution/results/experiment_a_ecp.csv` (750 rows) · `experiment_a_nuscenes_mini.csv` (6387 rows)
@@ -27,18 +27,31 @@ A log-odds occupancy grid is built for each keyframe from the aggregated LiDAR s
 - **Classification:** `< −0.5` → FREE · `> +0.5` → OCCUPIED · otherwise UNKNOWN  
 - **Ray caster:** Amanatides & Woo, Numba `@njit` JIT-compiled, ~2–3 M rays/s
 
+**Example — occupancy/free-space map for one keyframe:**
+
+![Occupancy map example](phase0_occupancy_map_example_ecp.png)
+*(placeholder — produced by §7 "BEV visualisation" in `phase0_freespace.ipynb`, which now saves this
+file automatically when run. Re-run with `DATASET = 'nuscenes_mini'` for the other dataset's version.)*
+
 ### 2.2 OBB free% query
 
 For each predicted box (centre, lwh, yaw in ego frame):
 
-1. Find the AABB of the OBB to enumerate candidate voxels  
-2. For each candidate voxel centre, rotate into the box-local frame:  
-   `lx = cos(yaw)·dx + sin(yaw)·dy`,  `ly = −sin(yaw)·dx + cos(yaw)·dy`  
-3. Keep only voxels satisfying `|lx| ≤ l/2`, `|ly| ≤ w/2`, `|lz| ≤ h/2` (true OBB membership)  
-4. Count how many kept voxels are certified-free  
-5. **OBB free% = n_free / n_total**
+1. **Identify candidate voxels.** The voxel grid is indexed along world X/Y/Z axes. To find which voxels could be inside the rotated box, compute the min/max world extents of the box's 8 corners and collect all voxels that fall within that range. This is a coarse over-approximation — the corners of that range extend beyond the actual rotated box — but it is cheap and guarantees no interior voxel is missed.
+2. **Test each candidate for true membership.** For each candidate voxel, compute its position relative to the box centre (`dx, dy, dz`), then express those offsets along the box's own length and width axes using the yaw rotation:  
+   `lx = cos(yaw)·dx + sin(yaw)·dy`  (distance along box length direction)  
+   `ly = −sin(yaw)·dx + cos(yaw)·dy`  (distance along box width direction)  
+   The voxel is inside the box if and only if:  
+   `|lx| ≤ length/2  AND  |ly| ≤ width/2  AND  |lz| ≤ height/2`  
+   This is a pure coordinate re-expression — no voxel moves, the physical inside/outside relationship is unchanged.
+3. **Count certified-free voxels** among those that passed the membership test.
+4. **OBB free% = n_free / n_total**
 
-Using AABB instead of OBB inflates free% artificially (corner triangles outside a rotated box are always free); OBB membership testing is required for correctness.
+**Example — OBB query walkthrough (coarse candidates → refined rotated-frame membership):**
+
+![OBB query walkthrough](phase0_obb_query_walkthrough_ecp.png)
+*(placeholder — produced by §12.1 "OBB free% query walkthrough" in `phase0_freespace.ipynb`, which
+saves this file automatically when run.)*
 
 ### 2.3 Overshoot flag
 
@@ -123,9 +136,9 @@ From the scatter and bar plots (Phase 0.4):
 
 ## 5. Phase 0.5 — GT Baseline Results (Category-Aware)
 
-The same OBB query is run on annotated GT boxes (LiDAR-space annotations) for every frame, giving the sensor-geometry floor: how much certified-free space a *correctly-fitted* box accumulates at a given range and category purely from beam density and voxel resolution. The GT baseline is computed per `(dataset, category, 5 m range bin)` to avoid mixing object types with different beam-penetration profiles (e.g. bicycle vs car).
+The same OBB query is run on annotated GT boxes (LiDAR-space annotations) for every frame, giving the **sensor-geometry reference free%**: how much certified-free space a *correctly-fitted* box accumulates at a given range and category purely from beam density and voxel resolution. The GT baseline is computed per `(dataset, category, 5 m range bin)` to avoid mixing object types with different beam-penetration profiles (e.g. bicycle vs car).
 
-### 5.1 GT floor by category at close range (0–15 m)
+### 5.1 Sensor-geometry reference free% by category at close range (0–15 m)
 
 | Category | ECP GT free% 0–5 m | ECP GT free% 5–10 m | nuScenes GT free% 5–10 m |
 |----------|-------------------|---------------------|--------------------------|
@@ -134,15 +147,15 @@ The same OBB query is run on annotated GT boxes (LiDAR-space annotations) for ev
 | pedestrian | 63% | 62% | 19% |
 | truck | — | — | 6% |
 
-Bicycles have the highest floor (thin object, beams pass straight through). Cars have the lowest floor on nuScenes (solid body, few penetrations). The wide per-category spread explains the large IQR seen in the aggregate floor — it was category mixing, not annotation imprecision.
+Bicycles accumulate the highest reference free% (thin object, beams pass straight through the volume). Cars accumulate the lowest on nuScenes (solid body, few beam penetrations). The wide spread in the aggregate (non-category-split) baseline seen earlier was category mixing — not annotation imprecision.
 
-**ECP GT is annotated in LiDAR space** (not projected from images), so the floor values are genuine sensor-geometry physics, not annotation error.
+**ECP GT is annotated in LiDAR space** (not projected from images), so these reference values — the "floor": the free% that even a correctly-fitted box shows, purely from sensor geometry — reflect genuine physics, not annotation error.
 
 ### 5.2 Corrected overshoot metric
 
 `excess_free% = predicted_free% − GT_median_free%(dataset, category, range_bin)`
 
-Boxes with `excess_free% > 5 pp` are considered genuinely overshooting above the sensor floor.
+Boxes with `excess_free% > 5 pp` are considered genuinely overshooting above the sensor-geometry reference level.
 
 ### 5.3 Category-aware results — Regime A
 
@@ -189,11 +202,11 @@ After GT correction, **median excess is near zero or negative in Regime A for bo
 
 ### C3. nuScenes Regime A has the strongest tail signal
 
-Because the 32-beam nuScenes GT floor is low (7% for cars at 5–10 m), the inflated close-range predictions are clearly visible above it. This is the primary locus of the image-proximity inflation effect: when an object fills the camera frame, SAM3D generates an oversized mesh, and the low nuScenes floor exposes this as a large positive excess.
+Because the 32-beam nuScenes sensor produces a low floor (7% for cars at 5–10 m — see §5.1), inflated close-range predictions stand out clearly above it, instead of partly blending into a high baseline the way they would on the denser 64-beam ECP sensor. This is where the image-proximity inflation effect shows up most strongly: when an object fills the camera frame, SAM3D generates an oversized mesh, and because the nuScenes floor is so low, that oversizing appears as a large positive excess rather than being absorbed into the baseline.
 
 ### C4. ECP Regime B has the most consistent median overshoot
 
-ECP Regime B shows genuine inflation even at the median: **bicycle +14.0 pp, motorcycle +16.3 pp, pedestrian +4.6 pp**. This is the range band where the 64-beam ECP floor has dropped enough to reveal systematic inflation above it, and where enough LiDAR beams remain to constrain a correction.
+ECP Regime B shows genuine inflation even at the median: **bicycle +14.0 pp, motorcycle +16.3 pp, pedestrian +4.6 pp**. This is the range band where the 64-beam ECP sensor-geometry reference free% has dropped enough to reveal systematic inflation above it, and where enough LiDAR beams remain to constrain a correction.
 
 ### C5. Regime C is clean — free-space provides no constraint there
 
@@ -201,7 +214,7 @@ Both datasets show near-zero excess and zero >20 pp fraction in Regime C. Free-s
 
 ### C6. SAM3D Objects does not use free-space for sizing
 
-Modes O1–O5 differ only in how the depth *position* of the pointmap is anchored. Size and shape are determined entirely by the generative prior (TRELLIS + nearest-neighbour mesh lookup). Phase 0 confirms this: the pivot depth is correct but the box can expand freely in all directions, producing the tail inflation.
+The O3 mode (used here) anchors the depth *position* of the pointmap via LiDAR. Size and shape are determined entirely by the generative prior (TRELLIS + nearest-neighbour mesh lookup). Phase 0 confirms this: the pivot depth is correct but the box can expand freely in all directions, producing the tail inflation.
 
 ---
 
@@ -222,6 +235,9 @@ Modes O1–O5 differ only in how the depth *position* of the pointmap is anchore
 
 2. **Single keyframe LiDAR only:** Phase 0 uses the keyframe sweep only. Temporal aggregation (agg=2, 5 frames) would certify more voxels free and likely strengthen the tail signal — testing this is the optional Phase 0.4-agg variant.
 
-3. **Fixed voxel resolution:** 0.2 m isotropic. Smaller voxels would increase sensitivity to thin objects (pedestrians, cyclists) but raise memory cost. Current resolution is sufficient to detect the systematic inflation found here.
+3. **Fixed voxel resolution:** 0.2 m isotropic. Halving to 0.1 m would give 8× more voxels (the cost cubes in 3D), providing finer discrimination especially for thin objects where the margin between inside and outside the box is only centimetres. Recommended tunable parameter for Phase 1/2 experiments.
 
 4. **No ego-motion compensation for aggregated sweeps:** Accumulated rays use ego-to-global transforms only; no intra-sweep motion compensation. At highway speeds this introduces ~0.1 m smear, acceptable at the current voxel size.
+
+
+[def]: phase0_gt_p90_by_category.png

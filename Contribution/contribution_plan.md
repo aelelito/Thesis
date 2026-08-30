@@ -956,6 +956,18 @@ You can state: *"we use no external size priors; where size cannot be measured, 
 from same-class instances measured in the same scene."* That is a strong, checkable claim and it's
 the removal-of-a-prior move that §19 explains your lab likes.
 
+### Considered and deferred: cross-scene accumulating memory
+
+An earlier idea was to let C4 accumulate size/shape evidence across frames and scenes as inference
+progresses, growing into a persistent lookup table rather than staying per-scene. **Deferred, not
+adopted** — it would quietly convert C4 from "no external size priors" into "no *hand-curated* size
+priors," a weaker, different claim (an online-learned prior is still external the moment it
+outlives the scene it was observed in). It also reintroduces the moving-object smearing failure
+already diagnosed in §25.2 if applied across frames of the same instance, and risks crossing into the
+offboard/temporal-refinement territory this plan explicitly avoids. Kept as an optional future
+ablation, not part of the core cascade — see `memory/project_regime_c_memory_idea.md` for the full
+reasoning if you want to prototype it later.
+
 ### C5. Propagation confidence
 
 Confidence in the propagated scale decays with:
@@ -1756,7 +1768,7 @@ rules of engagement.
 ```
 # Context: Sensor-Constrained Generative Auto-Labeling
 
-Read the file at /home/lleba/Thesis/Development/Contribution/contribution_plan.md — it is the
+Read the file at /media/leander/ECP_Nuscenes_01/Thesis/Contribution/contribution_plan.md — it is the
 full plan document for this work. Sections 0–9 are concepts, 10–19 are the things to build,
 20–24 are practical, 25–31 are clarifications and the ordered roadmap. Read all of it before
 doing anything.
@@ -1786,7 +1798,7 @@ literature is in the contribution_plan.md.
 ## Directory layout
 
 ```
-/home/lleba/Thesis/Development/
+/media/leander/ECP_Nuscenes_01/Thesis/
 ├── AutoLabeling/          # The existing full pipeline — DO NOT MODIFY until Phase 5+
 │   ├── src/autolabeling/  # Pipeline source
 │   │   ├── pipeline.py
@@ -1812,7 +1824,7 @@ literature is in the contribution_plan.md.
 
 ## Rules
 
-1. **All new code goes under /home/lleba/Thesis/Development/Contribution/.** Do not touch
+1. **All new code goes under /media/leander/ECP_Nuscenes_01/Thesis/Contribution/.** Do not touch
    AutoLabeling/, Models/, or Testing/ until explicitly told to integrate.
 2. **Use Jupyter notebooks (.ipynb)** for all experiments. One notebook per Phase or sub-phase.
 3. **The existing pipeline code is reference only.** Import from it, inspect it, but don't
@@ -1994,6 +2006,7 @@ Tier 1/2 drop to supporting roles. Either way you have a plan; you just need to 
 | 4.4 | Implement guidance with a strength schedule (weak → strong ramp) | [C] | Flag-guarded; strict no-op at strength 0. |
 | 4.5 | **Tier 1.5 fallback if gradients are painful**: generate K samples, score with §7, keep the best | [C] | No gradients, same principle, still novel. |
 | 4.6 | Evaluate Tier 2 vs. Tier 1 vs. baseline on E1/E3 | [E][P][T] | |
+| 4.6b | **Hybrid row: Tier 1 applied on top of Tier 2's output**, vs. Tier 2 alone | [A][T] | Tier 2's guidance is deliberately damped/regularised to stay in-distribution, so it likely undercorrects; Tier 1 has no such constraint and can polish the residual for free (identity-init, provably non-destructive). Predicted ordering: hybrid ≥ Tier 2 alone ≥ Tier 1 alone — keep all three rows separate so the paper can attribute gains correctly rather than only shipping the hybrid. |
 | 4.7 | **Guidance strength ablation** | [A][P] | Shows it's a controlled knob, not a lucky setting. |
 | 4.8 | **Ensemble spread before vs. after constraining**, per observability bin (§15) | [E][P] | Direct evidence the constraint collapsed the hypothesis space. No baseline can produce this figure. |
 
