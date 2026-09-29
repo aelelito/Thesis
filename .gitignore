@@ -1,36 +1,76 @@
-# ── Model weights & checkpoints ───────────────────────────────────────────────
-*.pt
-*.pth
-*.ckpt
-*.bin
-*.safetensors
-*.onnx
-*.gz
-*.pkl
-
-# ── SAM3 / SAM3D / TerraSeg third-party cloned repos (your notebooks at SAM3D/ are kept) ─
-Models/SAM3D/sam-3d-body/
-Models/SAM3D/sam-3d-objects/
-Models/SAM3D/detectron2/
-Models/TerraSeg
-Models/CompletionFormer
-.claude
-
-# ── Evaluation results & generated submissions ────────────────────────────────
-Evaluation/eval_results/
-Evaluation/submissions/nuscenes_mini/
-Evaluation/submissions/ecp/
-
-# ── Numpy arrays (masks, point clouds, etc.) ─────────────────────────────────
-*.npy
-*.npz
+# ── Editor / assistant state ──────────────────────────────────────────────────
+.claude/
 
 # ── Python cache ──────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
-
-# ── Misc ──────────────────────────────────────────────────────────────────────
 *.egg-info/
+
+# ── Secrets ─────────────────────────────────────────────────────────────────
 .env
+*token*.txt
+*.pem
+*.key
+id_rsa*
+
+# ── Model weights & checkpoints ────────────────────────────────────────────────
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+
+# ── Raw datasets, caches & third-party model repos (large, not ours to store) ──
+data/
+cache/
+models/
+
+# ── vespa (vendored TUMFTM/VESPA clone) — keep only our own scripts/configs ────
+vespa/*
+!vespa/frame_test.py
+!vespa/main_gt_labels.py
+!vespa/main_model_train.py
+!vespa/main_pseudo_combined.py
+!vespa/main_pseudo_combined2.py
+!vespa/main_pseudo_union.py
+!vespa/main_pseudo_vlm.py
+!vespa/main_pseudo_vlm2.py
+!vespa/main_visualize.py
+!vespa/configs/
+!vespa/notebooks/
+
+vespa/configs/*
+!vespa/configs/vlm/
+
+vespa/configs/vlm/*
+!vespa/configs/vlm/baseline-mini.yaml
+!vespa/configs/vlm/p_final.yaml
+
+vespa/notebooks/*
+!vespa/notebooks/error_analysis.ipynb
+!vespa/notebooks/tracking_inflation.ipynb
+
+# ── Container / Slurm job artifacts ────────────────────────────────────────────
+container/*.sif
+container/logs/
+*.err
+*.out
+*.log
+
+# ── Generated pipeline / evaluation outputs ────────────────────────────────────
+autolabeling/output/
+evaluation/eval_results/
+evaluation/old_eval_results/
+
+# ── Bulk numpy arrays & archives ────────────────────────────────────────────────
+*.npy
+*.npz
+*.gz
+
+# ── Pickled caches (keep small curated result pickles explicitly) ──────────────
+*.pkl
+!contribution_ideas/phase0/results/regime_examples_ecp.pkl
+!contribution_ideas/phase0/results/regime_examples_nuscenes_mini.pkl

@@ -1,0 +1,105 @@
+type: vlm
+data:
+  root_path: "./data/nuscenes_mini"
+  dataset: nuscenes
+  dataset_version: "v1.0-mini"
+remove_ground:
+  acc_M: 5 
+  ground_filter_xyradius_threshold: 40 # meters
+  ground_filter_zmin_threshold: -1 #meters
+  ground_filter_zmax_threshold: +1 #meters
+  global_ransac_min_sample_points: 250
+  global_ransac_residual_threshold: 0.1  # meters
+  global_ransac_max_trials: 20
+  cone_ransac_dmax_threshold: 0.30 # meters
+  cone_ransac_num_cones: 8
+  cone_ransac_min_cone_points: 500
+  cone_ransac_min_sample_points: 250
+  cone_ransac_residual_threshold: 0.05 # meters
+  cone_ransac_max_trials: 20
+  cone_ransac_max_height_to_global_ground: 0.15
+  rangefilter_sky_threshold: 4 # meters
+  rangefilter_range_threshold: 55 # meters
+grounding_sam:
+  class_names: ["car", "truck", "bus", "trailer", "excavator", "pedestrian", "motorcycle", "bicycle"]
+  detector: "IDEA-Research/grounding-dino-base"
+  det_threshold: 0.3
+  segmentator: "facebook/sam-vit-base"
+  nms_threshold: 0.5
+  refine_masks: true
+reprojection:
+  erosion_kernel_size: 5
+  erosion_iterations: 1
+denoising:
+  distance_based: true
+  xy_based: true
+  z_based: true
+appearance_embedding:
+  repo: facebookresearch/dinov2
+  model: dinov2_vits14_reg 
+multicam_object_merge:
+  camera_pairs_left_right: # [Left, Right]
+    - ["CAM_FRONT_LEFT", "CAM_FRONT"]
+    - ["CAM_FRONT", "CAM_FRONT_RIGHT"]
+    - ["CAM_FRONT_RIGHT", "CAM_BACK_RIGHT"]
+    - ["CAM_BACK_RIGHT", "CAM_BACK"]
+    - ["CAM_BACK", "CAM_BACK_LEFT"]
+    - ["CAM_BACK_LEFT", "CAM_FRONT_LEFT"]
+  camera_pair_side_threshold: 0.15
+  lidar_common_threshold: 0.01
+  compatible_class_groups:
+    - ["car", "truck", "bus"]
+    - ["truck", "trailer"]
+    - ["motorcycle", "bicycle"]
+  enable_camera_mask_based: true
+  enable_lidar_point_based: true
+velocity_by_app_tracking:
+  velocity_ref_types:
+    "car": "avg"
+    "truck": "avg"
+    "bus": "avg"
+    "trailer": "avg"
+    "excavator": "avg"
+    "pedestrian": "max"
+    "motorcycle": "avg"
+    "bicycle": "max"
+  compatible_class_groups:
+    - ["car", "truck", "bus"]
+    - ["truck", "trailer"]
+    - ["motorcycle", "bicycle"]
+  icp_search_size: 20.00 # meters
+  icp_search_step: 0.5 # meters
+  icp_max_iterations: 50
+  max_dist_inlier_threshold: 0.30 # meters
+  bbox_iou_threshold: 0.1
+  use_icp: true
+  icp_2d: true
+  filter_candidates_by_speed: true
+  velocity_diff_threshold: null
+yaw_heuristic:
+  speed_threshold: 0.5 # m/s
+  road_width: 10.0
+  width_length_min_factor: 0.5
+  enable_by_tracking: true
+  enable_by_size_heuristic: true
+  enable_by_road_heuristic: true
+  prioritize_by_tracking: false
+bbox_inflation:
+  enable_box_inflation: true
+  enable_box_inflation_away: true
+  avg_sizes: true
+object_filtering:
+  by_min_points:
+    "car": 5
+    "truck": 5
+    "bus": 5
+    "trailer": 20
+    "excavator": 25
+    "pedestrian": 1
+    "motorcycle": 2
+    "bicycle": 2
+  by_sam_confidence: 0.30
+
+
+
+

@@ -1,0 +1,264 @@
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset: nuscenes
+name: nuscenes_mini       # used for output directory and run name
+data_root: /workspace/data/nuScenes_mini
+version: v1.0-mini
+camera: CAM_FRONT         # single-camera fallback / evaluation
+# cameras:                  # multi-camera mode; comment out to use single camera only
+#   - CAM_FRONT
+#   - CAM_FRONT_LEFT
+#   - CAM_FRONT_RIGHT
+#   - CAM_BACK
+#   - CAM_BACK_LEFT
+#   - CAM_BACK_RIGHT
+split: train
+mapping_name: 8class
+
+# ── Output ────────────────────────────────────────────────────────────────────
+output_dir: /workspace/autolabeling/output/nuscenes_mini
+
+# ── Model paths ───────────────────────────────────────────────────────────────
+# null values are resolved automatically relative to dev_root
+models:
+  dev_root: /workspace
+  sam3_ckpt: /workspace/models/SAM3/checkpoints/sam3.pt   # null = auto-download from HuggingFace Hub
+  sam3d_body_repo: null      # null = <dev_root>/models/SAM3D/sam-3d-body
+  sam3d_obj_cfg: null        # null = <dev_root>/models/SAM3D/sam-3d-objects/checkpoints/hf/pipeline.yaml
+
+# ── Detection thresholds ──────────────────────────────────────────────────────
+thresholds:
+  sam3_score: 0.5            # min SAM3 mask probability to keep
+  min_mask_px: 100           # min mask area in pixels
+  body_bbox: 0.8             # ViTDet confidence threshold for SAM3D Body
+  sam3_iou_merge: 0.4        # IoU above which a ViTDet box duplicates a SAM3 box
+
+# ── LiDAR: aggregation + ground removal + the one pre-filter ──────────────────
+# Two aggregated clouds are built per keyframe (both ego-motion compensated to the
+# anchor frame, ego-body filter applied per sweep in that sweep's own ego frame):
+#
+#   FULL cloud (ground included) -> PseudoLabeler fit + B2's RANSAC fallback only.
+#       PseudoLabeler has to see ground to find it, and as an offline per-frame fit it
+#       benefits from the extra density.
+#   GROUND-FREE cloud -> B1 and every pointmap mode.
+#       TerraSeg (PTv3, trained on OmniLiDAR) runs PER SWEEP, in that sweep's own ego
+#       frame, BEFORE aggregating: it was trained/evaluated on single independent scans
+#       with height/range relative to each scan's own sensor origin, so running it on the
+#       aggregated cloud would be out-of-distribution, use the wrong origin for non-anchor
+#       points, and see motion-smeared trails. Per-sweep labels propagate through the
+#       ego-motion transform, so the aggregate is ground-free at no extra cost.
+#       (Write-up: notes/clean_pipeline_overview.md.)
+#
+# The ego-body filter is the ONLY LiDAR pre-filter. There is no range filter and no
+# OBB size/volume/ego filter anywhere in the pipeline.
+lidar_aggregation:
+  use_aggregation: true     # false -> anchor sweep only (TerraSeg still runs, on one sweep)
+  n_before: 3               # sweeps before the anchor keyframe  (nuScenes: 32-beam -> more sweeps)
+  n_after: 3                # sweeps after the anchor keyframe
+
+ground_removal:
+  terraseg_ckpt: /workspace/models/TerraSeg/checkpoints/terraseg_s.pth   # null = auto-download from HuggingFace
+
+# Ego-body filter: removes returns from the vehicle's own roof/windshield/mount.
+#   Only points inside the box AND within the Z band are removed:
+#     |x| < ego_box_half_x  AND  |y| < ego_box_half_y  AND  ego_box_z_min < z < ego_box_z_max
+lidar_filters:
+  use_ego_body_filter: true
+  ego_box_half_x: 4.0    # half-length fore/aft [m]
+  ego_box_half_y: 1.5    # half-width left/right [m]
+  ego_box_z_min:  0.5    # lower Z cutoff — preserves close ground returns [m]
+  ego_box_z_max:  2.5    # upper Z cutoff — preserves tall objects above [m]
+
+# ── SAM3D Objects — pointmap mode ─────────────────────────────────────────────
+# What depth information SAM3D Objects sees per frame. Set pointmap_mode to the
+# NUMBER (1-11) or the name:
+#   1  sparse_lidar              raw LiDAR only, NaN where there is no direct return.
+#                                One shared pointmap per frame.
+#   2  moge_affine_local         MoGe relative depth + a per-object affine Z = a*Z_moge + b
+#                                fitted on that object's HDBSCAN-cleaned in-mask LiDAR
+#                                (mask erosion before point selection). Per-object fallback:
+#                                local -> local_raw -> global_fallback -> unscaled_fallback.
+#                                Pixels outside the mask carry a plausible-but-WRONG depth.
+#   3  moge_affine_local_masked  same as 2, but every pixel outside the object's mask is
+#                                set to NaN before inference (PointPatchEmbed only
+#                                understands NaN as "no info" and attends over the whole
+#                                padded crop, background included).
+#   4  completionformer_full     CompletionFormer dense depth over the whole image: one pass
+#                                per frame, sparse anchors = per-mask HDBSCAN-cleaned
+#                                in-mask points + all out-of-mask points. No hull anchoring.
+#                                On a mask where HDBSCAN finds no dominant cluster, its in-mask
+#                                points are kept as-is by default; optional key
+#                                cformer_drop_on_failure (default false, NOT listed below) =
+#                                true drops them instead.
+#   5  moge_affine_local_raw     same fit as 2 on ALL in-mask points: no mask erosion, no
+#                                HDBSCAN (ablation of the point cleaning)
+#   6  moge_affine_local_piecewise  mode 2's object fit inside the mask + a separate robust
+#                                affine for everything outside it, fitted on the surrounding
+#                                LiDAR of the FULL cloud (ground included). Dense and metric
+#                                on both sides. Label: '<object label>+bg_<local|image|none>'.
+#   7  moge_affine_composite     ONE pointmap per frame: each detection's mask gets its own affine (nearer masks
+#                                painted over farther ones), the background is a spatially varying affine (per-cell
+#                                robust fits on a grid, blended smoothly) fitted on the LiDAR outside all masks.
+#                                Optional keys (defaults in code, NOT listed below so old checkpoints stay valid):
+#                                comp_grid [4, 3] (columns, rows), comp_min_pts 30, comp_margin 0.25.
+#   8  moge_affine_local_regslope  mode 6, but an ill-conditioned object slope (<=0 or off by more than
+#                                reg_slope_ratio, default 2.0, from the background slope) is replaced by the
+#                                background slope and the offset refitted so SAM3D's shift is unchanged.
+#   9  completionformer_raw      same CompletionFormer pass as mode 4, but with NO per-mask HDBSCAN
+#                                cleaning at all: the ground-free LiDAR projection goes in as-is
+#                                (ablation of mode 4's anchor-cleaning step).
+#   10 completionformer_ground   same per-mask HDBSCAN cleaning as mode 4, but IN-MASK anchors come from
+#                                the GROUND-FREE cloud (so a mask that dips to the road can't pull ground
+#                                points into the object's own cluster) while OUT-OF-MASK (background)
+#                                anchors come from the FULL cloud (ground included) -- the same
+#                                object/background split mode 6 uses, applied to CompletionFormer's
+#                                anchors instead of an affine fit. cformer_drop_on_failure applies.
+#   11 ldcm_full                 same anchors as mode 10 (ground-free in-mask, full-cloud background),
+#                                but fused by LDCM (ICLR 2026, github.com/aigc3d/LDCM) instead of
+#                                CompletionFormer: a frozen MoGe prior + a learned per-pixel LiDAR-fusion
+#                                network. Tried because MoGe + affine (mode 2) already beats CompletionFormer
+#                                (mode 4) here -- suggesting the image shape prior matters more than
+#                                faithfully spreading sparse LiDAR -- and LDCM keeps that prior while adding
+#                                learned fusion instead of a single per-object affine. cformer_drop_on_failure
+#                                applies here too. Needs ldcm_repo, ldcm_ckpt, ldcm_moge_ckpt, and
+#                                ldcm_utils3d_vendor (all set below) -- see the comments on those keys.
+# Every mode reads the ground-free cloud above, EXCEPT modes 10/11, which mix in the full cloud
+# (ground included) for their background anchors only -- see the mode 10/11 notes above. Each
+# run's checkpoints live in a mode-specific directory, so switching mode never resumes another
+# mode's results.
+sam3d_objects:
+  pointmap_mode: 2
+  # Modes 4/9/10 only -----------------------------------------------------------
+  cformer_ckpt: /workspace/models/CompletionFormer/checkpoints/KITTIDC/KITTIDC_L1L2.pt
+  lidar_lines: 32      # nuScenes: 32-beam Velodyne (CompletionFormer was trained on 64-beam KITTI)
+  # Mode 11 only ----------------------------------------------------------------
+  ldcm_repo: /workspace/models/LDCM
+  ldcm_ckpt: /workspace/models/LDCM/checkpoints/LDCM
+  ldcm_moge_ckpt: /workspace/models/LDCM/checkpoints/moge-2-vits-normal/model.pt
+  ldcm_utils3d_vendor: /home/nfs/lleba/.ldcm_utils3d_vendor  # see SAM3DObjectsModel._load_ldcm
+  # when two large clusters both have >= proximity_min_pts pts and the second is
+  # >= proximity_ratio x largest, keep the CLOSER one in ego space
+  proximity_min_pts: 30
+  proximity_ratio: 0.70
+  # Modes 2/3: erode the binary mask before HDBSCAN point selection to reduce border
+  # bleed-in from adjacent objects (the un-eroded mask is still the object's extent).
+  mask_erode_px: 3          # structuring element radius [px] (0 = disabled)
+  mask_erode_min_px: 0      # min mask area [px] to apply erosion (0 = always)
+  # Storage: the OBB of every object is fitted on its FULL mesh and stored in the checkpoint; afterwards only this
+  # many random vertices are kept per mesh and the faces are dropped (0 = keep the full ~300k-vertex mesh, ~5 MB per
+  # object). Bicycles and motorcycles keep all their vertices (their box is refitted together with the rider).
+  # Not part of the checkpoint hash: old full-mesh checkpoints stay valid and are slimmed on load.
+  mesh_points: 20000
+  # Mode 6 only: background affine fit
+  bg_pad_factor: 1.5        # fit region = object mask bbox scaled by this (falls back to whole image)
+  bg_min_pts: 20            # min background LiDAR points in that region for the local fit
+  bg_exclude_px: 5          # ignore LiDAR within this many px of the mask (border bleed)
+  bg_feather_px: 2          # blur radius of the object/background seam (0 = hard switch)
+  # HDBSCAN params for in-mask surface point isolation (B1 + modes 2/3/4).
+  # Tuned per class: smaller/sparser objects use tighter eps; large vehicles need
+  # a wider eps to merge subclusters across the body.
+  hdbscan:
+    pedestrian:
+      min_cluster_size: 3
+      min_samples: 1
+      cluster_eps: 0.20
+    bicycle:
+      min_cluster_size: 3
+      min_samples: 1
+      cluster_eps: 0.20
+    motorcycle:
+      min_cluster_size: 3
+      min_samples: 1
+      cluster_eps: 0.30
+    car:
+      min_cluster_size: 3
+      min_samples: 1
+      cluster_eps: 0.50
+    truck:
+      min_cluster_size: 5
+      min_samples: 1
+      cluster_eps: 0.60
+    construction vehicle:
+      min_cluster_size: 5
+      min_samples: 1
+      cluster_eps: 0.60
+    bus:
+      min_cluster_size: 5
+      min_samples: 1
+      cluster_eps: 0.80
+    trailer:
+      min_cluster_size: 5
+      min_samples: 1
+      cluster_eps: 0.70
+
+# ── SAM3D Body ─────────────────────────────────────────────────────────────────
+# Independent toggles. SAM3D Body only sees a bounding box (never the mask) and its
+# depth tz is coupled to its own regressed body height, so:
+#   b1_depth_correction: override tz with the HDBSCAN median depth of the pedestrian's
+#       in-mask ground-free LiDAR (fallback: 15th percentile), recompute tx/ty from the
+#       mask centroid, rigidly shift the mesh. Fixes depth-scale, not full vertical extent.
+#   b2_ground_anchoring: shift the mesh vertically so its lowest vertex sits on the local
+#       ground height from the per-frame PseudoLabeler MLP (RANSAC fallback if the fit fails).
+sam3d_body:
+  b1_depth_correction: true
+  b2_ground_anchoring: true
+
+# ── Cross-class deduplication ─────────────────────────────────────────────────
+# When the same physical object is detected under two different prompts, the
+# lower-priority class is removed if mask IoU > iou_thresh.
+# Equal-priority pairs are kept as-is.  Raise a class's value to make it "win"
+# over others; lower it to make it more likely to be replaced.
+cross_class_dedup:
+  iou_thresh: 0.5
+  priority:                   # strictly unique — every pair has a definite winner
+    pedestrian:           0   # generic person
+    car:                  1   # generic vehicle
+    bicycle:              2   # bike frame only (rider handled by SAM3D Body + OBB merge)
+    truck:                3   # specific vehicle; beaten by bus / constr. / trailer
+    motorcycle:           4   # motorised rider > bicycle
+    trailer:              5   # more specific
+    bus:                  6   # large vehicle > truck
+    construction vehicle: 7   # heavy equipment and most specific
+
+# ── SAM3 prompts ──────────────────────────────────────────────────────────────
+# pipeline: 'body' → SAM3D Body | 'objects' → SAM3D Objects
+# Note: 'bicycle and cyclist' split into 'bicycle' (objects) + 'pedestrian' (body).
+# Rider OBBs are merged with the bike OBB in post-processing (_merge_rider_obbs).
+prompts:
+  pedestrian:           body
+  car:                  objects
+  bicycle:              objects
+  motorcycle:           objects
+  bus:                  objects
+  truck:                objects
+  construction vehicle: objects
+  trailer:              objects
+
+# ── Cross-camera duplicate suppression ────────────────────────────────────────
+# Runs after all per-camera pipelines are complete when multi-camera mode is
+# enabled (cameras: list above has > 1 entry).
+#
+# Two-pass matching per adjacent camera pair, per keyframe:
+#   Main pass  — BEV OBB footprint overlap ≥ bev_overlap_thresh, greedy by
+#                descending overlap.
+#   Fallback   — ResNet18 appearance embedding cosine similarity for any
+#                border candidate still unmatched (greedy, no threshold).
+# The detection with the smaller SAM3 mask is suppressed.
+cross_camera_merge:
+  enabled: true
+  # Fraction of image width that defines the "border zone" on each side.
+  border_threshold: 0.15
+  # Minimum BEV footprint overlap (intersection / area_of_smaller_OBB) for the main pass.
+  bev_overlap_thresh: 0.10
+  # Classes that are allowed to match each other across cameras (in addition to same-class).
+  compatible_class_groups:
+    - [car, truck]
+    - [motorcycle, bicycle]
+    - [truck, trailer, bus]
+  # Adjacent camera pairs (left_cam, right_cam).
+  adjacent_cam_pairs:
+    - [CAM_FRONT_LEFT,  CAM_FRONT]
+    - [CAM_FRONT,       CAM_FRONT_RIGHT]
+    - [CAM_FRONT_RIGHT, CAM_BACK_RIGHT]
+    - [CAM_BACK_RIGHT,  CAM_BACK]
+    - [CAM_BACK,        CAM_BACK_LEFT]
+    - [CAM_BACK_LEFT,   CAM_FRONT_LEFT]
