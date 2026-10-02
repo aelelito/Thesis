@@ -1,6 +1,7 @@
 # Mesh-level mask fit / free-space / ground evidence — full-dataset spec
 
-Status: 2026-09-29, **spec only, nothing run**. Relationship to `contribution_ideas/phase0/`: that work measured
+Status: 2026-09-29 spec, **run completed 2026-10-01** (see §"Status" at the bottom and `results/REPORT.md`).
+Relationship to `contribution_ideas/phase0/`: that work measured
 **OBBs** from the **old** pipeline (O3+B1, all cameras) against certified free space, with a GT floor correction.
 This work measures the **mesh** (and the pipeline's own OBB) from the **current clean pipeline**, adds a GT-floor
 control at the shape level, and adds the "would in-mask LiDAR depth already have caught this" classification that
@@ -11,20 +12,20 @@ not repeated here. Pilot work (4 hand-picked frames) and the causal mask-perturb
 follow-up, agreed with the user over several rounds of discussion (see that notebook's chat history for the
 reasoning behind each choice below; only the conclusions are restated here).
 
-## Open decisions (blocking the run, not the code)
+## Open decisions (resolved; kept for the record)
 
-1. **Pointmap mode** — still being decided by the running `cmp7` sweep (`autolabeling/output/{ecp,nuscenes_mini}/cmp7_*`,
-   queue not yet drained as of 2026-09-29). Likely mode 2 per `notes/sam3d_objects_mode_decision.md`, not final.
-2. **Cross-camera merge** — undecided. Does not block starting: merge is a post-processing step on top of SAM3D's
-   output (`cross_camera_merge`), not part of inference, so it can be applied to the same checkpoints later without
-   re-running SAM3D.
-3. **Rider merge for bicycles/motorcycles** — resolved for *how* it's used (see "Rider merge" below), but not yet
-   started because it needs SAM3D Body, which needs the mode decision to not be wasted effort if the checkpoint
-   layout changes.
+1. **Pointmap mode** — at spec time, still being decided by the `cmp7` sweep. The **final decision for the
+   pipeline is mode 11 (LDCM)**, made after a later all-camera comparison (see `notes/sam3d_objects_mode_decision.md`).
+   This investigation deliberately runs on **mode 2**'s full meshes instead, captured before that final decision —
+   the user's explicit call (proving mask/free-space fit doesn't depend on which pointmap mode generated the mesh;
+   mode 2's full-mesh data was already available, mode 11's was not). Not an oversight.
+2. **Cross-camera merge** — was undecided at spec time; did not block starting, since merge is a post-processing
+   step on top of SAM3D's output, not part of inference.
+3. **Rider merge for bicycles/motorcycles** — resolved as described in "Rider merge" below.
 
-**Do not touch** `autolabeling/configs/nuscenes.yaml` / `configs/ecp.yaml`, or anything under `mode_selection/` or
-`cmp7_*/`, until the queue is confirmed drained — those files are read fresh at task execution time, not copied at
-submission, so editing them can corrupt a still-pending array task.
+The queue-drain caution below no longer applies (the `cmp7` sweep finished and `mode_selection`/`cmp7_*` are final),
+kept only as a historical note of why edits were held off at the time: configs are read fresh at task execution
+time, not copied at submission, so editing them while an array task is still pending can corrupt it.
 
 ## Scope
 
@@ -103,3 +104,13 @@ Per dataset (and category where n allows it): the five numbers above, paired aga
 CI and sign test where a paired comparison applies (mirrors `notes/sam3d_objects_mode_decision.md`'s standard, not
 a plain mean/percentage). A handful of hand-picked frames get the full visual treatment (mask overlay, occupancy
 map, side view) afterward, chosen from whatever this batch run flags as clear and convincing.
+
+## Status (2026-10-01): full run + both matching protocols done, see results/REPORT.md
+LiDAR-containment matching (`results/summary.md`) and nuScenes-devkit-style center-distance matching at all 4
+official thresholds (`results/summary_nuscenes_matching.md`, built by `scripts/rematch.py` from the cheap
+`scripts`/`autolabeling.batch_boxes` box-only extraction -- no mesh re-render needed) now agree on every claim.
+`results/REPORT.md` is the consolidated write-up. Bug fixed along the way: `rematch.py`'s ECP category-mapping
+fallback was gated on a condition ("does any category contain an underscore") that's false for ECP's category
+names, silently dropping all ECP GT boxes -- fixed, verified ECP rows now populate correctly across all thresholds.
+Outstanding: claim 4 (floor control) under the nuScenes-style match (needs reopening meshes for the matched subset,
+cheap but not yet built); the PseudoLabeler ground-baseline bias check noted in claim 3.

@@ -99,6 +99,20 @@ def parse_args():
         help='Override sam3d_objects.pointmap_mode from the config (number 1-11 or name), e.g. for mode sweeps.',
     )
     parser.add_argument(
+        '--cameras', default=None,
+        help="Override cfg.cameras: comma-separated camera names (e.g. 'CAM_FRONT,CAM_BACK'), or 'all' for every "
+             "camera of the dataset (nuScenes: the 6-camera ring; ECP: the 3 front cameras) -- see the commented-out "
+             "lists in the config. >1 camera routes through the multi-camera pipeline with cross-camera merge.",
+    )
+    parser.add_argument(
+        '--mesh-points', type=int, default=None,
+        help='Override sam3d_objects.mesh_points: vertex count each SAM3D Objects mesh is downsampled to before '
+             'checkpointing (faces always dropped). 0 = keep the full mesh + faces. NOT part of the checkpoint '
+             'hash, so a stage already cached at one mesh_points value loads unchanged (only re-slimmed in '
+             'memory) -- to actually get full meshes on disk, this must be set before the objects stage is '
+             'first computed for that checkpoint dir.',
+    )
+    parser.add_argument(
         '--cformer-drop-on-failure', default=None, choices=['true', 'false'],
         help="Override sam3d_objects.cformer_drop_on_failure (mode 4/10/11 only): whether in-mask points are "
              "kept as-is when HDBSCAN finds no dominant cluster (default false) or dropped instead ('true').",
@@ -119,7 +133,8 @@ def parse_args():
     parser.add_argument(
         '--prepare-only', action='store_true',
         help='Compute only the mode-independent stages (SAM3, TerraSeg, PseudoLabeler, SAM3D Body) into the '
-             'checkpoints and stop: no SAM3D Objects, no submission files. Single-camera runs only.',
+             'checkpoints and stop: no SAM3D Objects, no submission files. Also works for multi-camera runs '
+             '(--cameras): runs prepare stages for every camera, skips cross-camera merge.',
     )
     parser.add_argument(
         '--no-checkpoint', action='store_true',
@@ -145,6 +160,26 @@ def main():
         _fd = [s.strip() for s in args.force_drop.split(',') if s.strip()] or None
         cfg.sam3d_objects.force_drop_modalities = _fd
         cfg_raw['sam3d_objects']['force_drop_modalities'] = _fd
+    if args.mesh_points is not None:
+        cfg.sam3d_objects.mesh_points = args.mesh_points
+        cfg_raw['sam3d_objects']['mesh_points'] = args.mesh_points
+    if args.cameras is not None:
+        _ALL_CAMS = {
+            'nuscenes_mini': ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
+                              'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
+            'nuscenes':      ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
+                              'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
+            'ecp':           ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT'],
+        }
+        if args.cameras.strip().lower() == 'all':
+            _ds_key = getattr(cfg, 'name', cfg.dataset)
+            if _ds_key not in _ALL_CAMS:
+                sys.exit(f"--cameras all: no known camera list for dataset '{_ds_key}'")
+            _cams = _ALL_CAMS[_ds_key]
+        else:
+            _cams = [s.strip() for s in args.cameras.split(',') if s.strip()]
+        cfg.cameras = _cams
+        cfg_raw['cameras'] = _cams
 
     output_dir   = Path(args.output_dir or cfg.output_dir)
     split        = args.split or cfg.split  # CLI overrides config; always 'train' or 'val'
@@ -248,14 +283,17 @@ def main():
         build_submission, remap_submission, write_submission,
     )
 
-    if _multi_cam and args.prepare_only:
-        sys.exit('--prepare-only supports single-camera runs only')
     if _multi_cam:
         from src.autolabeling.pipeline import run_multi_camera_pipeline
         from src.autolabeling.writers.submission import build_submission_multi_cam
         body_results_all, obj_results_all = run_multi_camera_pipeline(
             cfg, frames_per_cam, checkpoint_dir=checkpoint_dir, nusc=nusc,
+            prepare_only=args.prepare_only,
         )
+        if args.prepare_only:
+            print(f'\nPrepared {len(frames)} keyframe(s) × {len(_cameras_list)} camera(s) in '
+                  f'{checkpoint_dir}. No submission written (prepare-only).')
+            return
         submission_8class = build_submission_multi_cam(
             frames_per_cam=frames_per_cam,
             body_results_all=body_results_all,

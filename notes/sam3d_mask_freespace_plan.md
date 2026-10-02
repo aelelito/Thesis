@@ -45,11 +45,12 @@ NOT established: that the mesh "obviously" overshoots into free space (glass / u
 shift along the LiDAR ray, and the split of violating points by whether the in-mask depth would have seen them (the professor's "what does free space add" question).
 Next: run all four frames, paste `summary_all_frames` and figures, then decide.
 
-## Full-scale follow-up (2026-09-29)
+## Full-scale follow-up (2026-09-29, run completed 2026-10-01)
 The pilot above (4 hand-picked frames) is done. The full-dataset, all-cameras version is specced in
 `contribution_ideas/phase0_mesh_freespace/PLAN.md` — five final metrics (mask recall/IoU, free-space touch of mesh
 and OBB vs GT floor, below-ground reach vs GT via PseudoLabeler, the GT-floor shape-isolation control, and the
-"not implied by in-mask depth" share). Blocked on: the mode-decision sweep (`cmp7_*`, queue not yet drained —
-DO NOT touch `configs/nuscenes.yaml` / `configs/ecp.yaml` until it is), cross-camera merge decision (doesn't block
-starting), rider-merge decision (resolved: bike-only for mesh metrics, rider-merged for the pipeline-OBB-vs-GT
-metric only).
+"not implied by in-mask depth" share) — **and has now been run**; see `contribution_ideas/phase0_mesh_freespace/results/REPORT.md`.
+It used mode 2's full meshes (captured before the mode decision was finalized; the pipeline's final mode is 11 —
+see `notes/sam3d_objects_mode_decision.md` — but this investigation is about mask/free-space fit in general, not
+mode-specific, so mode 2's already-available full meshes were used deliberately rather than redone for mode 11).
+Rider-merge: resolved (bike-only for mesh metrics, rider-merged for the pipeline-OBB-vs-GT metric only).

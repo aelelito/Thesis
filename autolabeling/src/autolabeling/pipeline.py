@@ -1074,6 +1074,7 @@ def run_multi_camera_pipeline(
     device: Optional[str] = None,
     checkpoint_dir: Optional[Path] = None,
     nusc=None,
+    prepare_only: bool = False,
 ) -> tuple:
     """
     Run the full pipeline for every camera in frames_per_cam, then apply
@@ -1114,10 +1115,13 @@ def run_multi_camera_pipeline(
             cam_ckpt = (Path(checkpoint_dir) / cam) if checkpoint_dir else None
             body_r, obj_r = run_pipeline(
                 cfg, frames, device=device, checkpoint_dir=cam_ckpt, nusc=nusc,
-                lidar_cache_dir=lidar_cache,
+                lidar_cache_dir=lidar_cache, prepare_only=prepare_only,
             )
             body_results_all[cam] = body_r
             obj_results_all[cam]  = obj_r
+
+    if prepare_only:
+        return body_results_all, obj_results_all
 
     # Cross-camera duplicate suppression
     _xc_cfg = getattr(cfg, 'cross_camera_merge', None)

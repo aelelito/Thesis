@@ -91,9 +91,11 @@ training distribution argument was made explicit.)
 The clean-notebook design now lives in `autolabeling/src/autolabeling/pipeline.py`, config-driven
 via `configs/nuscenes.yaml` / `configs/ecp.yaml` (same keys in both).
 
-**Select the mode:** `sam3d_objects.pointmap_mode: 1..4` (or the name) —
-1 `sparse_lidar`, 2 `moge_affine_local`, 3 `moge_affine_local_masked`, 4 `completionformer_full`.
-Run `run_pipeline.py --config ...` once per mode (change `--run-name`/`output_dir` to keep the JSONs apart).
+**Select the mode:** `sam3d_objects.pointmap_mode: 1..11` (or the name) — grew from the original 4 to 11 candidates
+during the mode-decision investigation; full list and what each one does in `notes/sam3d_objects_mode_decision.md`.
+**Final decision: mode 11 (`ldcm_full`)**, chosen after a full-dataset, all-camera comparison — see that doc for
+the results and reasoning. Run `run_pipeline.py --config ...` once per mode (change `--run-name`/`output_dir` to
+keep the JSONs apart), or `--pointmap-mode` to override without editing the config.
 
 **Data flow per keyframe**
 - Per sweep, in its own ego frame: ego-body filter (only filter) -> TerraSeg -> keep non-ground -> to anchor frame -> concatenate = `pts_ego` (ground-free; B1 + all modes).

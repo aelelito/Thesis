@@ -351,19 +351,18 @@ cd /tudelft.net/staff-umbrella/TeamHolgerResearch/lleba/Thesis
 
 WORKDIR=/workspace/evaluation bash container/run_in_container.sh python evaluation.py \
   --dataset nuscenes \
-  --submission /workspace/autolabeling/output/nuscenes_mini/front_cam_o1/autolabel_nuscenes_mini_1class.json \
-  --out_dir eval_results/nuscenes_mini/front_cam_o1/1class/ \
+  --submission /workspace/autolabeling/output/nuscenes_mini/all_cam_mode_2/autolabel_nuscenes_mini_1class.json \
+  --out_dir eval_results/nuscenes_mini/all_cam_mode_2/1class/ \
   --plot_examples 20
 
 WORKDIR=/workspace/evaluation bash container/run_in_container.sh python evaluation.py \
   --dataset ecp \
-  --submission /workspace/autolabeling/output/ecp/<run_name>/autolabel_ecp_8class.json \
-  --out_dir eval_results/ecp/<run_name>/8class/ \
+  --submission /workspace/autolabeling/output/ecp/all_cam_mode_11/autolabel_ecp_1class.json \
+  --out_dir eval_results/ecp/all_cam_mode_11/1class/ \
   --plot_examples 33
 
 # generate report
 cd /tudelft.net/staff-umbrella/TeamHolgerResearch/lleba/Thesis
 WORKDIR=/workspace/evaluation bash container/run_in_container.sh python make_eval_report.py \
-  --eval_dir eval_results/nuscenes_mini/vespa_front_cam_only/1class/ \
-  --out_dir eval_results/nuscenes_mini/vespa_front_cam_only/1class/
-
+  --eval_dir eval_results/ecp/all_cam_mode_2/1class/ \
+  --out_dir eval_results/ecp/all_cam_mode_2/1class/
